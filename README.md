@@ -101,3 +101,13 @@ python scripts/build_index.py
 This project is licensed under the Creative Commons Attribution 4.0 International License (CC BY 4.0).
 
 See [`LICENSE`](LICENSE) or <https://creativecommons.org/licenses/by/4.0/>.
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=ASLP-lab%2FArxivWatcher&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/image?repos=ASLP-lab/ArxivWatcher&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/image?repos=ASLP-lab/ArxivWatcher&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/image?repos=ASLP-lab/ArxivWatcher&type=date&legend=top-left" />
+ </picture>
+</a>
