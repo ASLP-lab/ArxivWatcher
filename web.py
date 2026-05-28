@@ -10,10 +10,12 @@
 环境变量:
   WEB_HOST      默认 127.0.0.1
   WEB_PORT      默认 8080
+  WEB_THREADS   Waitress 工作线程数，默认 8
   RUN_SCRIPT    每日执行的脚本，默认 ./run.sh
   DAILY_HOUR    每日运行小时（24h，北京时间），默认 10
   DAILY_MINUTE  每日运行分钟，默认 0
   ARXIV_CHECK_CATEGORIES  开跑前检查是否已更新到今天的分类（空格分隔）
+  ADMIN_TOKEN   /admin/* 管理接口的 Bearer token
   WEB_PUBLIC_URL  对外暴露的访问地址，注入到 run.sh 进程供飞书消息使用
   FEISHU_WEBHOOK_URL  飞书 webhook，注入到 run.sh 进程
 
@@ -28,6 +30,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import subprocess
 import sys
 import threading
@@ -71,6 +74,26 @@ app = Flask(
     template_folder=str(TEMPLATES_DIR),
     static_folder=str(STATIC_DIR),
 )
+
+
+def _admin_auth_error():
+    """Return an error response when the management token is missing or invalid."""
+    expected = os.environ.get("ADMIN_TOKEN", "").strip()
+    if not expected:
+        log.warning("ADMIN_TOKEN 未配置，拒绝访问管理接口")
+        return {"ok": False, "msg": "ADMIN_TOKEN is not configured"}, 403
+
+    auth_header = request.headers.get("Authorization", "")
+    prefix = "Bearer "
+    provided = ""
+    if auth_header.startswith(prefix):
+        provided = auth_header[len(prefix) :].strip()
+    if not provided:
+        provided = request.headers.get("X-Admin-Token", "").strip()
+
+    if not secrets.compare_digest(provided, expected):
+        return {"ok": False, "msg": "unauthorized"}, 401
+    return None
 
 
 # ─────────────────────────────────────────────
@@ -1072,9 +1095,12 @@ class DailyScheduler(threading.Thread):
         self._stop_event.set()
 
 
-@app.route("/admin/run-now", methods=["POST", "GET"])
+@app.route("/admin/run-now", methods=["POST"])
 def admin_run_now():
-    """手动触发一次每日任务（默认仅本机可访问）。"""
+    """手动触发一次每日任务。"""
+    auth_error = _admin_auth_error()
+    if auth_error:
+        return auth_error
     if not _scheduler:
         return {"ok": False, "msg": "scheduler not started"}, 500
     threading.Thread(
@@ -1085,6 +1111,9 @@ def admin_run_now():
 
 @app.route("/admin/status")
 def admin_status():
+    auth_error = _admin_auth_error()
+    if auth_error:
+        return auth_error
     if not _scheduler:
         return {"running": False}
     return {
@@ -1107,6 +1136,7 @@ def main() -> None:
     global _scheduler
     host = os.environ.get("WEB_HOST", "127.0.0.1")
     port = int(os.environ.get("WEB_PORT", "8080"))
+    threads = int(os.environ.get("WEB_THREADS", "8"))
     hour = int(os.environ.get("DAILY_HOUR", "10"))
     minute = int(os.environ.get("DAILY_MINUTE", "0"))
     run_script = Path(os.environ.get("RUN_SCRIPT", str(ROOT / "run.sh"))).resolve()
@@ -1125,8 +1155,13 @@ def main() -> None:
     )
     _scheduler.start()
 
-    log.info(f"🌐 启动 Web 服务 http://{host}:{port}")
-    app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True)
+    try:
+        from waitress import serve
+    except ImportError as e:
+        raise SystemExit("缺少生产 WSGI server：请先安装 waitress（例如 uv sync 或 pip install waitress）") from e
+
+    log.info(f"🌐 启动 Web 服务 http://{host}:{port} (waitress, threads={threads})")
+    serve(app, host=host, port=port, threads=threads)
 
 
 if __name__ == "__main__":
