@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}历史报告 — arXiv 每日精读{% endblock %}
+
+{% block content %}
+<section class="page-header">
+  <h1>📚 历史报告</h1>
+  <p class="subtitle">共 {{ items|length }} 天，点击日期查看当天的论文精读</p>
+</section>
+
+<section class="history-grid">
+  {% for it in items %}
+  <a class="history-card" href="{{ url_for('view_date', date=it.date) }}">
+    <div class="history-date">{{ it.date }}</div>
+    <div class="history-stats">
+      <span>📊 {{ it.total }} 篇</span>
+      {% if it.cross != 0 and it.cross != '?' %}<span>🔀 {{ it.cross }}</span>{% endif %}
+    </div>
+    {% if it.categories %}
+      <div class="history-cats">{{ it.categories|join(' / ') }}</div>
+    {% endif %}
+    {% if it.llm_model %}<div class="history-model">{{ it.llm_model }}</div>{% endif %}
+  </a>
+  {% endfor %}
+</section>
+{% endblock %}

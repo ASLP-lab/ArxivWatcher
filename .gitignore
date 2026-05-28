@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+ENV/
+env/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# IDE / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+*.bak
+*.swp
+
+# Logs & temp
+*.log
+logs/
+arxiv_digest_work/
+*.pdf
+
+# Generated outputs
+report_*.html
+reports/
+data/papers/
+data/visits.json
+
+# Local / internal only (do not publish)
+.git_back/
+trash/
+frp_*/
+frp_*.toml
+
+# Misc
+.coverage
+nosetests.xml
+coverage.xml
+*.cover

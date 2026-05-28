@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}RSS 订阅 — arXiv 每日精读{% endblock %}
+
+{% block content %}
+<section class="page-header">
+  <h1>📡 RSS 订阅</h1>
+  <p class="subtitle">复制订阅链接到 RSS 阅读器，即可自动接收最新论文精读。</p>
+</section>
+
+<section class="rss-card">
+  <form class="rss-form" action="{{ url_for('rss_page') }}" method="get">
+    <label>分类码
+      <select name="cat">
+        <option value="">全部分类</option>
+        {% for c in categories %}
+          <option value="{{ c }}" {% if c == cat %}selected{% endif %}>{{ c }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>条目数量
+      <input type="number" min="1" max="200" name="limit" value="{{ limit }}">
+    </label>
+    <button type="submit">更新订阅链接</button>
+  </form>
+
+  <div class="rss-link-wrap">
+    <div class="rss-link-title">订阅地址</div>
+    <code class="rss-link">{{ feed_url }}</code>
+  </div>
+
+  <div class="paper-links">
+    <a href="{{ feed_url }}" target="_blank">打开 XML</a>
+    <a href="{{ url_for('rss_feed', cat=cat, limit=limit) }}" target="_blank">相对地址</a>
+  </div>
+</section>
+
+<section class="search-results">
+  {% for p in papers %}
+  <article class="paper-card">
+    <div class="paper-card-top">
+      <a class="date-link" href="{{ url_for('view_date', date=p.date) }}">{{ p.date }}</a>
+      {% for c in p.source_categories %}<span class="cat-tag">{{ c }}</span>{% endfor %}
+      {% if p.is_cross_list %}<span class="badge badge-cross">跨领域</span>{% endif %}
+    </div>
+    <h2><a href="{{ p.abs_url }}" target="_blank">{{ p.title }}</a></h2>
+    <div class="paper-authors">{{ p.authors|join(', ') }}</div>
+    {% if p.abstract %}
+      <details class="abstract"><summary>摘要</summary><p>{{ p.abstract }}</p></details>
+    {% endif %}
+  </article>
+  {% else %}
+    <p class="empty-hint">当前条件下没有可订阅的论文。</p>
+  {% endfor %}
+</section>
+{% endblock %}

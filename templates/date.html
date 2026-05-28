@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}
+{% if is_today %}今日 · {% endif %}{{ date }} — arXiv 每日精读
+{% endblock %}
+
+{% block content %}
+<section class="date-toolbar">
+  <div class="date-toolbar-left">
+    <h1 class="date-title">
+      {% if is_today %}<span class="today-pill">今日</span>{% endif %}
+      {{ date }}
+    </h1>
+    {% if index %}
+    <div class="date-stats">
+      <span>📊 {{ index.total }} 篇</span>
+      <span>🔀 跨领域 {{ index.cross_count }}</span>
+      {% if index.categories %}<span>📡 {{ index.categories|join(' / ') }}</span>{% endif %}
+      {% if index.llm_model %}<span>🤖 {{ index.llm_model }}</span>{% endif %}
+    </div>
+    {% endif %}
+  </div>
+  <div class="date-toolbar-right">
+    {% if prev_date %}
+      <a class="nav-btn" href="{{ url_for('view_date', date=prev_date) }}">← {{ prev_date }}</a>
+    {% endif %}
+    {% if next_date %}
+      <a class="nav-btn" href="{{ url_for('view_date', date=next_date) }}">{{ next_date }} →</a>
+    {% endif %}
+    {% if html_exists %}
+      <a class="nav-btn action-download" href="{{ url_for('download_html', date=date) }}">下载网页</a>
+    {% endif %}
+    <a class="nav-btn action-zotero" href="{{ url_for('zotero_plugin_page') }}">导入 Zotero</a>
+    {% if html_exists %}
+      <a class="nav-btn outline" href="{{ url_for('raw_html', date=date) }}" target="_blank">在新标签打开</a>
+    {% endif %}
+  </div>
+</section>
+
+{% if html_exists %}
+<div class="report-frame-wrap">
+  <iframe class="report-frame" src="{{ url_for('raw_html', date=date) }}" loading="lazy"></iframe>
+</div>
+{% elif index %}
+<section class="paper-list">
+  {% for p in index.papers %}
+    <article class="paper-card">
+      <h2><a href="{{ p.abs_url }}" target="_blank">{{ p.title }}</a></h2>
+      <div class="paper-meta-line">
+        {% for c in p.source_categories %}<span class="cat-tag">{{ c }}</span>{% endfor %}
+        {% if p.is_cross_list %}<span class="badge badge-cross">跨领域</span>{% endif %}
+      </div>
+      {% if p.related_org_titles %}
+      <div class="org-tag-row">
+        {% for org in p.related_org_titles %}<span class="org-tag">{{ org }}</span>{% endfor %}
+      </div>
+      {% endif %}
+      <div class="paper-authors">{{ p.authors|join(', ') }}</div>
+      {% if p.abstract %}<details class="abstract"><summary>查看摘要</summary><p>{{ p.abstract }}</p></details>{% endif %}
+    </article>
+  {% endfor %}
+</section>
+{% else %}
+<div class="empty-hint">该日期没有报告。</div>
+{% endif %}
+{% endblock %}

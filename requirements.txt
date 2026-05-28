@@ -1,0 +1,5 @@
+beautifulsoup4>=4.14.0
+requests>=2.30.0
+pypdf>=6.0.0
+markdown>=3.0.0
+flask>=3.0.0

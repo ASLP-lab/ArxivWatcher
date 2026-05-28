@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}搜索 — arXiv 每日精读{% endblock %}
+
+{% block content %}
+<section class="page-header">
+  <h1>🔍 搜索论文</h1>
+  <p class="subtitle">在标题、作者、分类码（如 <code>cs.SD</code>）、摘要中匹配关键词</p>
+</section>
+
+<form class="search-form" action="{{ url_for('search') }}" method="get">
+  <div class="search-form-row">
+    <label>关键词
+      <input type="search" name="q" value="{{ q }}" placeholder="如：speech, attention, Smith, cs.SD" autofocus>
+    </label>
+    <label>分类码
+      <input type="text" name="cat" value="{{ cat }}" placeholder="如 cs.SD / eess.AS">
+    </label>
+    <label>日期
+      <select name="date">
+        <option value="">全部日期</option>
+        {% for d in all_dates %}
+        <option value="{{ d }}" {% if d == date %}selected{% endif %}>{{ d }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <button type="submit">搜索</button>
+  </div>
+</form>
+
+{% if q or cat or date %}
+  <div class="search-summary">
+    {% if truncated %}显示前{% else %}找到{% endif %} <strong>{{ results|length }}</strong> 个结果
+    {% if truncated %}（已截断，请缩小条件）{% endif %}
+    {% if q %} · 关键词 <code>{{ q }}</code>{% endif %}
+    {% if cat %} · 分类 <code>{{ cat }}</code>{% endif %}
+    {% if date %} · 日期 <code>{{ date }}</code>{% endif %}
+  </div>
+
+  <section class="search-results">
+    {% for p in results %}
+      <article class="paper-card">
+        <div class="paper-card-top">
+          <a class="date-link" href="{{ url_for('view_date', date=p.date) }}">{{ p.date }}</a>
+          {% for c in p.source_categories %}<span class="cat-tag">{{ c }}</span>{% endfor %}
+          {% if p.is_cross_list %}<span class="badge badge-cross">跨领域</span>{% endif %}
+        </div>
+        {% if p.related_org_titles %}
+          <div class="org-tag-row">
+            {% for org in p.related_org_titles %}<span class="org-tag">{{ org }}</span>{% endfor %}
+          </div>
+        {% endif %}
+        <h2><a href="{{ p.abs_url }}" target="_blank">{{ p.title }}</a></h2>
+        <div class="paper-authors">{{ p.authors|join(', ') }}</div>
+        {% if p.subjects %}<div class="paper-subjects">{{ p.subjects }}</div>{% endif %}
+        {% if p.abstract %}
+          <details class="abstract"><summary>摘要</summary><p>{{ p.abstract }}</p></details>
+        {% endif %}
+        <div class="paper-links">
+          <a href="{{ p.abs_url }}" target="_blank">📄 abstract</a>
+          {% if p.pdf_url %}<a href="{{ p.pdf_url }}" target="_blank">📥 pdf</a>{% endif %}
+          <a href="{{ url_for('view_date', date=p.date) }}">查看当天报告 →</a>
+        </div>
+      </article>
+    {% else %}
+      <p class="empty-hint">没有匹配的论文。</p>
+    {% endfor %}
+  </section>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{% block title %}arXiv 每日论文精读{% endblock %}</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+{% block head_extra %}{% endblock %}
+</head>
+<body>
+<header class="site-header">
+  <div class="site-header-inner">
+    <a class="brand" href="{{ url_for('index') }}">
+      <span class="brand-emoji">📚</span>
+      <span class="brand-text">arXiv 每日精读</span>
+    </a>
+    <nav class="site-nav">
+      <a href="{{ url_for('index') }}" class="{% if request.endpoint in ['index', 'today', 'view_date'] %}active{% endif %}">今日</a>
+      <a href="{{ url_for('history') }}" class="{% if request.endpoint == 'history' %}active{% endif %}">历史</a>
+      <a href="{{ url_for('search') }}" class="{% if request.endpoint == 'search' %}active{% endif %}">搜索</a>
+      <a href="{{ url_for('rss_page') }}" class="{% if request.endpoint in ['rss_page', 'rss_feed'] %}active{% endif %}">RSS</a>
+      <a href="{{ url_for('zotero_plugin_page') }}" class="{% if request.endpoint == 'zotero_plugin_page' %}active{% endif %}">Zotero</a>
+      <a href="{{ url_for('stats') }}" class="{% if request.endpoint == 'stats' %}active{% endif %}">统计</a>
+    </nav>
+    <a class="visit-pill {% if request.endpoint == 'stats' %}is-active{% endif %}"
+       href="{{ url_for('stats') }}"
+       title="点击查看完整访问统计">
+      <span class="visit-pill-eye" aria-hidden="true">👁</span>
+      <span class="visit-pill-label">今日</span>
+      <span class="visit-pill-num">{{ '{:,}'.format(today_visits) }}</span>
+      <span class="visit-pill-sep">·</span>
+      <span class="visit-pill-label">累计</span>
+      <span class="visit-pill-num">{{ '{:,}'.format(total_visits) }}</span>
+    </a>
+    <form class="site-search" action="{{ url_for('search') }}" method="get">
+      <input type="search" name="q" placeholder="搜索标题 / 作者 / cs.SD ..." value="{{ request.args.get('q', '') }}">
+      <button type="submit">🔍</button>
+    </form>
+  </div>
+</header>
+
+<main class="site-main">
+  {% block content %}{% endblock %}
+</main>
+
+<footer class="site-footer">
+  <p>
+    数据来源：<a href="https://arxiv.org" target="_blank">arXiv.org</a>
+    · 当前北京时间 {{ now_bj.strftime('%Y-%m-%d %H:%M') }}
+    · 共 {{ all_dates|length }} 天报告
+    · <a href="{{ url_for('stats') }}">访问 {{ '{:,}'.format(total_visits) }}</a>
+  </p>
+</footer>
+
+</body>
+</html>

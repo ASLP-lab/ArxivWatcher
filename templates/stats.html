@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}访问统计 · arXiv 每日精读{% endblock %}
+
+{% block content %}
+<section class="stats-hero">
+  <div class="stats-hero-card stats-hero--today">
+    <div class="stats-hero-icon">👁</div>
+    <div class="stats-hero-label">今日访问</div>
+    <div class="stats-hero-num">{{ '{:,}'.format(today_total) }}</div>
+    <div class="stats-hero-foot">{{ today_str }}（北京时间）</div>
+  </div>
+  <div class="stats-hero-card stats-hero--total">
+    <div class="stats-hero-icon">📈</div>
+    <div class="stats-hero-label">累计访问</div>
+    <div class="stats-hero-num">{{ '{:,}'.format(total) }}</div>
+    <div class="stats-hero-foot">共 {{ day_count }} 个活跃日</div>
+  </div>
+  <div class="stats-hero-card stats-hero--avg">
+    <div class="stats-hero-icon">📊</div>
+    <div class="stats-hero-label">日均访问</div>
+    <div class="stats-hero-num">{{ '{:g}'.format(avg_per_day) }}</div>
+    <div class="stats-hero-foot">基于活跃日</div>
+  </div>
+  <div class="stats-hero-card stats-hero--peak">
+    <div class="stats-hero-icon">🔥</div>
+    <div class="stats-hero-label">今日峰值</div>
+    {% if peak_hour_idx >= 0 %}
+    <div class="stats-hero-num">{{ peak_hour_count }}</div>
+    <div class="stats-hero-foot">{{ '%02d:00 - %02d:59' | format(peak_hour_idx, peak_hour_idx) }}</div>
+    {% else %}
+    <div class="stats-hero-num">—</div>
+    <div class="stats-hero-foot">今日暂无数据</div>
+    {% endif %}
+  </div>
+</section>
+
+<section class="stats-section">
+  <div class="stats-section-head">
+    <h2><span class="stats-section-icon">⏱</span> 今日 24 小时分布</h2>
+    <span class="stats-section-sub">鼠标悬停可查看精确数值</span>
+  </div>
+  {% if today_total %}
+  <div class="hour-chart">
+    {% for h in range(24) %}
+    <div class="hour-col" data-tip="{{ '%02d:00 → %d 次' | format(h, today_hourly[h]) }}">
+      <div class="hour-bar-wrap">
+        <div class="hour-bar {% if h == peak_hour_idx and peak_hour_count %}is-peak{% endif %}"
+             style="height: {{ hourly_pct[h] }}%"></div>
+      </div>
+      <div class="hour-label">{{ '%02d' | format(h) }}</div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="empty-hint">今日暂无访问，刷新一下页面就能看到第一条记录 ✨</p>
+  {% endif %}
+</section>
+
+<section class="stats-section">
+  <div class="stats-section-head">
+    <h2><span class="stats-section-icon">📅</span> 最近 {{ recent|length }} 天访问</h2>
+    <span class="stats-section-sub">蓝色高亮 = 今日</span>
+  </div>
+  {% if recent %}
+  <div class="day-chart-wrap">
+    <div class="day-chart">
+      {% for d in recent %}
+      <div class="day-col" data-tip="{{ d.date }} → {{ d.total }} 次">
+        <div class="day-bar-wrap">
+          <div class="day-bar {% if d.is_today %}is-today{% endif %}"
+               style="height: {{ d.pct }}%"></div>
+        </div>
+        <div class="day-label">{{ d.date[5:] }}</div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  <details class="stats-table-wrap">
+    <summary>查看每日明细</summary>
+    <table class="stats-table">
+      <thead><tr><th>日期</th><th>访问</th></tr></thead>
+      <tbody>
+      {% for d in recent|reverse %}
+        <tr {% if d.is_today %}class="is-today"{% endif %}>
+          <td><code>{{ d.date }}</code></td>
+          <td>{{ d.total }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </details>
+  {% else %}
+  <p class="empty-hint">还没有任何访问记录</p>
+  {% endif %}
+</section>
+{% endblock %}

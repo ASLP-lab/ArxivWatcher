@@ -1,0 +1,113 @@
+{% extends "base.html" %}
+{% block title %}Zotero 自动导入插件 — arXiv 每日精读{% endblock %}
+
+{% block content %}
+<section class="page-header">
+  <h1>📥 Zotero 自动导入插件</h1>
+  <p class="subtitle">一次安装，Zotero 自动把每日 arXiv 报告网页下载为本地副本，无需再点按钮。</p>
+</section>
+
+<section class="plugin-hero">
+  <div class="plugin-hero-left">
+    <h2>arxiv-daily-importer</h2>
+    <p>Zotero 7+ 插件，启动后会自动同步当天报告，并每小时检查一次新报告。</p>
+    <ul class="plugin-feature-list">
+      <li>✅ Zotero 启动自动同步当天报告</li>
+      <li>✅ 每 60 分钟自动检查新报告</li>
+      <li>✅ 已导入日期自动去重，永不重复</li>
+      <li>✅ 首次安装只导入今天，不会一次性灌入历史</li>
+      <li>✅ 导入的是本地 HTML 副本，可直接点开</li>
+      <li>✅ 可设置默认 Zotero 文件夹（Collection）</li>
+    </ul>
+  </div>
+  <div class="plugin-hero-right">
+    {% if plugin_available %}
+      <a class="plugin-download-btn" href="{{ url_for('zotero_plugin_xpi') }}">
+        <span class="plugin-download-icon">⬇️</span>
+        <span class="plugin-download-title">下载插件</span>
+        <span class="plugin-download-sub">arxiv-daily-importer.xpi</span>
+      </a>
+      <p class="plugin-download-hint">下载后无需解压，在 Zotero 中通过齿轮菜单安装。</p>
+      <p class="plugin-download-hint">插件 update_url 使用 HTTPS：<code>{{ plugin_update_url }}</code></p>
+    {% else %}
+      <div class="plugin-download-btn disabled">
+        <span class="plugin-download-icon">⚠️</span>
+        <span class="plugin-download-title">插件不可用</span>
+        <span class="plugin-download-sub">服务端未找到插件文件</span>
+      </div>
+    {% endif %}
+  </div>
+</section>
+
+<section class="plugin-steps">
+  <h2>安装步骤</h2>
+  <ol>
+    <li>
+      点击右上角 <strong>下载插件</strong>，获得 <code>arxiv-daily-importer.xpi</code>。
+    </li>
+    <li>
+      打开 Zotero，进入菜单 <code>工具</code> → <code>插件</code>。
+    </li>
+    <li>
+      点击窗口右上角 <strong>齿轮图标</strong>，选择 <code>Install Add-on From File...</code>。
+    </li>
+    <li>
+      选择刚下载的 <code>arxiv-daily-importer.xpi</code>，确认安装。
+    </li>
+    <li>
+      <strong>重启 Zotero</strong>，等待约 8 秒，今日报告会自动导入。
+    </li>
+  </ol>
+</section>
+
+<section class="plugin-config">
+  <h2>默认配置</h2>
+  <p class="subtitle">
+    插件默认连接服务地址：<code>{{ public_host }}</code>。
+    如果你需要换成内网穿透或别的地址，可在 Zotero 的 <code>Run JavaScript</code> 中执行：
+  </p>
+<pre class="config-block"><code>const b = Services.prefs.getBranch("extensions.arxiv-daily-importer.");
+b.setStringPref("reportURLTemplate", "{{ public_host }}/download/{date}.html");
+b.setStringPref("datesAPI", "{{ public_host }}/api/dates");
+b.setIntPref("intervalMinutes", 60);
+b.setBoolPref("autoImport", true);
+b.setStringPref("defaultCollectionPath", "arXiv/每日精读");</code></pre>
+</section>
+
+<section class="plugin-menu">
+  <h2>Zotero 工具菜单</h2>
+  <p class="subtitle">安装后，Zotero 的 <code>工具</code> 菜单下会出现：</p>
+  <ul class="plugin-feature-list">
+    <li>☑ <strong>自动每日导入 arXiv 报告</strong>：开关，默认开启</li>
+    <li><strong>立即同步最新 arXiv 报告</strong>：手动触发一次</li>
+    <li><strong>导入指定日期的 arXiv 报告...</strong>：兜底，手动指定任意日期</li>
+    <li><strong>设置 arXiv 报告默认导入文件夹...</strong>：设置默认 Collection，留空则导入库根目录</li>
+  </ul>
+</section>
+
+<section class="plugin-faq">
+  <h2>常见问题</h2>
+  <details open>
+    <summary>安装提示 incompatible / update_url 错误？</summary>
+    <p>Zotero 9 要求插件 manifest 里的 <code>update_url</code> 必须是 <strong>HTTPS</strong>。本页下载的 xpi 会自动写入：</p>
+    <p><code>{{ plugin_update_url }}</code></p>
+    <p>请确保该 HTTPS 地址可访问（服务器需设置 <code>WEB_PUBLIC_URL=https://你的域名</code>）。不要用旧的本地 xpi 文件。</p>
+  </details>
+  <details>
+    <summary>历史报告会被一起灌进 Zotero 吗？</summary>
+    <p>不会。<strong>首次安装只导入今天</strong>，历史日期会被标记为“已处理”而不实际下载。如果你希望补导入某一天，使用菜单里的 <code>导入指定日期的 arXiv 报告...</code>。</p>
+  </details>
+  <details>
+    <summary>会重复导入吗？</summary>
+    <p>不会。已导入的日期被写入 Zotero 偏好 <code>extensions.arxiv-daily-importer.importedDates</code>，下次自动同步会自动跳过。</p>
+  </details>
+  <details>
+    <summary>Zotero 关掉之后还会导入吗？</summary>
+    <p>不会。同步任务依赖 Zotero 运行；下次启动 Zotero 时会自动补齐遗漏的日期。</p>
+  </details>
+  <details>
+    <summary>服务暂时连不上会出什么问题？</summary>
+    <p>插件会静默跳过本轮，下一轮 60 分钟后再尝试，不会反复弹错。</p>
+  </details>
+</section>
+{% endblock %}

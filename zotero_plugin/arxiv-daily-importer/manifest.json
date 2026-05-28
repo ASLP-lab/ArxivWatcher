@@ -1,0 +1,14 @@
+{
+  "manifest_version": 2,
+  "name": "arXiv Daily Importer",
+  "version": "0.1.9",
+  "description": "Auto-import daily arXiv report HTML pages as local copies into Zotero.",
+  "author": "arxiv-daily-importer",
+  "applications": {
+    "zotero": {
+      "id": "arxiv-daily-importer@local",
+      "strict_min_version": "6.999",
+      "strict_max_version": "9.*"
+    }
+  }
+}

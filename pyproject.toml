@@ -1,0 +1,27 @@
+[project]
+name = "arxivwatcher"
+version = "2.0.0"
+description = "ArxivWatcher — arXiv 每日论文监控与精读工具，自动抓取、LLM深度解读、邮件推送"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "xjsc01", email = "550566903@qq.com" }
+]
+license = { text = "CC BY 4.0" }
+keywords = ["arxiv", "watcher", "llm", "paper-digest", "academic", "daily-updates"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "beautifulsoup4>=4.14.0",
+    "requests>=2.30.0",
+    "pypdf>=6.0.0",
+    "markdown>=3.0.0",
+    "flask>=3.1.3",
+]
