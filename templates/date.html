@@ -28,37 +28,100 @@
     {% endif %}
     {% if html_exists %}
       <a class="nav-btn action-download" href="{{ url_for('download_html', date=date) }}">下载网页</a>
+      <a class="nav-btn outline" href="{{ url_for('raw_html', date=date) }}" target="_blank">原始报告</a>
     {% endif %}
     <a class="nav-btn action-zotero" href="{{ url_for('zotero_plugin_page') }}">导入 Zotero</a>
-    {% if html_exists %}
-      <a class="nav-btn outline" href="{{ url_for('raw_html', date=date) }}" target="_blank">在新标签打开</a>
-    {% endif %}
   </div>
 </section>
 
-{% if html_exists %}
+<aside class="lab-feed" id="lab-feed" style="display:none">
+  <div class="lab-feed-head">
+    <span class="lab-feed-title">📢 ASLP 实验室动态</span>
+    <a class="lab-feed-more" href="https://www.npu-aslp.org/article/news" target="_blank" rel="noopener noreferrer">更多 →</a>
+  </div>
+  <ul class="lab-feed-list" id="lab-feed-list"></ul>
+</aside>
+<script>
+(function () {
+  function esc(s) { var d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
+  fetch('/api/lab-feed?limit=5', { credentials: 'same-origin', cache: 'no-store' })
+    .then(function (r) { return r.ok ? r.json() : { items: [] }; })
+    .then(function (d) {
+      var items = (d && d.items) || [];
+      if (!items.length) return;
+      var html = '';
+      items.forEach(function (it) {
+        var tagClass = it.type === 'news' ? 'lab-feed-tag-news' : 'lab-feed-tag-notice';
+        var title = it.link
+          ? '<a href="' + esc(it.link) + '" target="_blank" rel="noopener noreferrer">' + esc(it.title) + '</a>'
+          : esc(it.title);
+        html += '<li class="lab-feed-item">';
+        html += '<span class="lab-feed-tag ' + tagClass + '">' + esc(it.type_label) + '</span>';
+        html += '<span class="lab-feed-date">' + esc(it.date) + '</span>';
+        html += '<span class="lab-feed-item-title">' + title + '</span>';
+        html += '</li>';
+      });
+      document.getElementById('lab-feed-list').innerHTML = html;
+      document.getElementById('lab-feed').style.display = '';
+    })
+    .catch(function () {});
+})();
+</script>
+
+{% if index %}
+<section class="list-controls" id="list-controls" style="display:none">
+  <div class="lc-group lc-sort">
+    <span class="lc-label">排序</span>
+    <button class="lc-btn active" data-sort="index" onclick="ArxivApp.setSort('index',this)">原始序号 #</button>
+    <button class="lc-btn" data-sort="likes" onclick="ArxivApp.setSort('likes',this)">点赞数</button>
+    <button class="lc-btn" data-sort="comments" onclick="ArxivApp.setSort('comments',this)">评论数</button>
+  </div>
+  <div class="lc-group lc-expand">
+    <button class="lc-btn" onclick="ArxivApp.expandAll()">展开全部</button>
+    <button class="lc-btn" onclick="ArxivApp.collapseAll()">折叠全部</button>
+  </div>
+  <div class="lc-group lc-community">
+    <span class="lc-label">画线</span>
+    <button type="button" class="lc-btn active" id="lc-community-btn" onclick="ArxivApp.toggleCommunityMarks(this)">公共画线</button>
+  </div>
+</section>
+<div id="paper-container" class="paper-list-dynamic">
+  <div class="loading-indicator">加载论文中...</div>
+</div>
+
+<!-- 浮动操作按钮 + 目录抽屉 -->
+<div class="fab-stack" id="fab-stack" style="display:none">
+  <button class="fab" type="button" title="展开目录" aria-label="展开目录" onclick="ArxivApp.toggleToc()">
+    <svg viewBox="0 0 16 16" width="20" height="20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M2.5 12a.5.5 0 0 1 .5-.5h10a.5.5 0 0 1 0 1H3a.5.5 0 0 1-.5-.5m0-4a.5.5 0 0 1 .5-.5h10a.5.5 0 0 1 0 1H3a.5.5 0 0 1-.5-.5m0-4a.5.5 0 0 1 .5-.5h10a.5.5 0 0 1 0 1H3a.5.5 0 0 1-.5-.5"/></svg>
+  </button>
+  <button class="fab" type="button" title="上一篇" aria-label="上一篇" onclick="ArxivApp.gotoPaper(-1)">
+    <svg viewBox="0 0 16 16" width="20" height="20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M7.646 4.646a.5.5 0 0 1 .708 0l6 6a.5.5 0 0 1-.708.708L8 5.707l-5.646 5.647a.5.5 0 0 1-.708-.708z"/></svg>
+  </button>
+  <button class="fab" type="button" title="下一篇" aria-label="下一篇" onclick="ArxivApp.gotoPaper(1)">
+    <svg viewBox="0 0 16 16" width="20" height="20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M1.646 4.646a.5.5 0 0 1 .708 0L8 10.293l5.646-5.647a.5.5 0 0 1 .708.708l-6 6a.5.5 0 0 1-.708 0l-6-6a.5.5 0 0 1 0-.708z"/></svg>
+  </button>
+  <button class="fab fab-top" type="button" title="回到顶部" aria-label="回到顶部" onclick="ArxivApp.scrollTop()">
+    <svg viewBox="0 0 16 16" width="20" height="20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M7.646 2.646a.5.5 0 0 1 .708 0l6 6a.5.5 0 0 1-.708.708L8 3.707 2.354 9.354a.5.5 0 1 1-.708-.708zm0 5a.5.5 0 0 1 .708 0l6 6a.5.5 0 0 1-.708.708L8 8.707l-5.646 5.647a.5.5 0 0 1-.708-.708z"/></svg>
+  </button>
+</div>
+<aside class="toc-drawer" id="toc-drawer">
+  <div class="toc-head">
+    <span class="toc-head-title">目录</span>
+    <button class="toc-close" type="button" aria-label="关闭目录" onclick="ArxivApp.toggleToc()">&times;</button>
+  </div>
+  <ol class="toc-list" id="toc-list"></ol>
+</aside>
+<div class="toc-backdrop" id="toc-backdrop" onclick="ArxivApp.toggleToc()"></div>
+
+<script src="{{ static_asset('highlights.js') }}"></script>
+<script src="{{ static_asset('app.js') }}"></script>
+<script>
+  ArxivApp.init('{{ date }}', {% if current_user %}'{{ current_user }}'{% else %}null{% endif %}, '{{ papers_digest or "" }}');
+</script>
+{% elif html_exists %}
 <div class="report-frame-wrap">
   <iframe class="report-frame" src="{{ url_for('raw_html', date=date) }}" loading="lazy"></iframe>
 </div>
-{% elif index %}
-<section class="paper-list">
-  {% for p in index.papers %}
-    <article class="paper-card">
-      <h2><a href="{{ p.abs_url }}" target="_blank">{{ p.title }}</a></h2>
-      <div class="paper-meta-line">
-        {% for c in p.source_categories %}<span class="cat-tag">{{ c }}</span>{% endfor %}
-        {% if p.is_cross_list %}<span class="badge badge-cross">跨领域</span>{% endif %}
-      </div>
-      {% if p.related_org_titles %}
-      <div class="org-tag-row">
-        {% for org in p.related_org_titles %}<span class="org-tag">{{ org }}</span>{% endfor %}
-      </div>
-      {% endif %}
-      <div class="paper-authors">{{ p.authors|join(', ') }}</div>
-      {% if p.abstract %}<details class="abstract"><summary>查看摘要</summary><p>{{ p.abstract }}</p></details>{% endif %}
-    </article>
-  {% endfor %}
-</section>
 {% else %}
 <div class="empty-hint">该日期没有报告。</div>
 {% endif %}

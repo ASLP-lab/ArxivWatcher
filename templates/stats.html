@@ -9,6 +9,12 @@
     <div class="stats-hero-num">{{ '{:,}'.format(today_total) }}</div>
     <div class="stats-hero-foot">{{ today_str }}（北京时间）</div>
   </div>
+  <div class="stats-hero-card stats-hero--active">
+    <div class="stats-hero-icon">👤</div>
+    <div class="stats-hero-label">今日活跃用户</div>
+    <div class="stats-hero-num">{{ '{:,}'.format(today_active_users) }}</div>
+    <div class="stats-hero-foot">基于浏览器 cookie 去重</div>
+  </div>
   <div class="stats-hero-card stats-hero--total">
     <div class="stats-hero-icon">📈</div>
     <div class="stats-hero-label">累计访问</div>
@@ -19,7 +25,7 @@
     <div class="stats-hero-icon">📊</div>
     <div class="stats-hero-label">日均访问</div>
     <div class="stats-hero-num">{{ '{:g}'.format(avg_per_day) }}</div>
-    <div class="stats-hero-foot">基于活跃日</div>
+    <div class="stats-hero-foot">日均活跃 {{ '{:g}'.format(avg_active_users_per_day) }} 人</div>
   </div>
   <div class="stats-hero-card stats-hero--peak">
     <div class="stats-hero-icon">🔥</div>
@@ -65,7 +71,7 @@
   <div class="day-chart-wrap">
     <div class="day-chart">
       {% for d in recent %}
-      <div class="day-col" data-tip="{{ d.date }} → {{ d.total }} 次">
+      <div class="day-col" data-tip="{{ d.date }} → {{ d.total }} 次 / {{ d.active_users }} 人">
         <div class="day-bar-wrap">
           <div class="day-bar {% if d.is_today %}is-today{% endif %}"
                style="height: {{ d.pct }}%"></div>
@@ -78,12 +84,13 @@
   <details class="stats-table-wrap">
     <summary>查看每日明细</summary>
     <table class="stats-table">
-      <thead><tr><th>日期</th><th>访问</th></tr></thead>
+      <thead><tr><th>日期</th><th>访问</th><th>活跃用户</th></tr></thead>
       <tbody>
       {% for d in recent|reverse %}
         <tr {% if d.is_today %}class="is-today"{% endif %}>
           <td><code>{{ d.date }}</code></td>
           <td>{{ d.total }}</td>
+          <td>{{ d.active_users }}</td>
         </tr>
       {% endfor %}
       </tbody>

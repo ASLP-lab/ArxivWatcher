@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}{{ paper_title }} — {{ date }} · arXiv 每日精读{% endblock %}
+
+{% block content %}
+<section class="date-toolbar paper-share-toolbar">
+  <div class="date-toolbar-left">
+    <h1 class="date-title paper-share-title">{{ paper_title }}</h1>
+    <div class="date-stats">
+      <span>📅 {{ date }}</span>
+      <span>🔗 单篇分享</span>
+    </div>
+  </div>
+  <div class="date-toolbar-right">
+    <a class="nav-btn outline" href="{{ url_for('view_date', date=date) }}">查看当日全部 {{ index.total }} 篇</a>
+    <a class="nav-btn" href="{{ url_for('index') }}">返回首页</a>
+  </div>
+</section>
+
+<div id="paper-container" class="paper-list-dynamic paper-share-list">
+  <div class="loading-indicator">加载论文中...</div>
+</div>
+
+<script src="{{ static_asset('highlights.js') }}"></script>
+<script src="{{ static_asset('app.js') }}"></script>
+<script>
+  ArxivApp.initShare(
+    '{{ date }}',
+    {% if current_user %}'{{ current_user }}'{% else %}null{% endif %},
+    '{{ paper_id }}',
+    '{{ paper_digest }}'
+  );
+</script>
+{% endblock %}

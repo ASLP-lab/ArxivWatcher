@@ -1,0 +1,71 @@
+# ── 版本控制 / 备份 ──
+.git/
+.git_back/
+.gitignore
+
+# ── Python 虚拟环境与缓存（镜像里会用 uv 重建 venv）──
+.venv/
+venv/
+ENV/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+.ruff_cache/
+.ipynb_checkpoints/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.coverage
+nosetests.xml
+coverage.xml
+*.cover
+uv.lock
+
+# ── 运行时生成的数据（容器里用 volume 挂载，不进镜像）──
+data/*.json
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/.secret_key
+data/papers/
+reports/
+report_*.html
+
+# ── 日志与临时产物 ──
+logs/
+*.log
+*.pdf
+arxiv_digest_work/
+static/_h/
+
+# ── 内部部署脚本（含密钥/LDAP/token，绝对不能进镜像）──
+start_web_internal.sh
+run_internal.sh
+
+# ── 仅本地存在的内网穿透工具 / 内部目录 ──
+frp_*/
+frp_*.toml
+trash/
+# exporter/ 是 Prometheus node/gpu exporter 的本地离线包（49MB 二进制 + 含内网用户名/IP 的部署目录），
+# 跟 ArxivWatcher 应用完全无关，绝不进镜像
+exporter/
+
+# ── IDE / OS ──
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+*.bak
+*.swp
+
+# ── Docker 自身文件，避免循环 COPY ──
+Dockerfile
+.dockerignore
+docker-compose*.yml
+
+# ── 项目文档 / 元数据（运行不需要，可减小镜像体积）──
+README.md
+LICENSE
+.star-history/

@@ -27,13 +27,29 @@ arxiv_digest_work/
 report_*.html
 reports/
 data/papers/
-data/visits.json
+static/_h/
+
+# Runtime data & secrets (never publish)
+data/*.json
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/.secret_key
+data/papers/
+
+# Internal deployment scripts (credentials, LDAP, tokens, proxies)
+start_web_internal.sh
+run_internal.sh
 
 # Local / internal only (do not publish)
 .git_back/
 trash/
 frp_*/
 frp_*.toml
+# exporter/ 是 Prometheus node/gpu exporter 的本地离线包（含 49MB 二进制 + 内网用户名/IP 部署目录），与本项目无关
+exporter/
+# disco.py 是本地 PyTorch 分布式测试脚本，与本项目无关
+disco.py
 
 # Misc
 .coverage

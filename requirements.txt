@@ -4,3 +4,4 @@ pypdf>=6.0.0
 markdown>=3.0.0
 flask>=3.0.0
 waitress>=3.0.2
+bcrypt>=4.0.0

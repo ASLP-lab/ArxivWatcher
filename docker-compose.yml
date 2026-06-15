@@ -1,0 +1,76 @@
+# ArxivWatcher — Docker Compose 示例
+# 启动: docker compose up -d
+# 日志: docker compose logs -f
+# 停止: docker compose down
+# 升级: docker compose pull && docker compose up -d
+
+services:
+  arxivwatcher:
+    # 镜像名：发布到 Docker Hub 用 "你的用户名/arxivwatcher:tag"
+    # 本地构建可改用 build: .
+    image: aslplab/arxivwatcher:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: arxivwatcher
+    restart: unless-stopped
+
+    ports:
+      - "${WEB_PORT:-8091}:8091"
+
+    environment:
+      # ── Web ──
+      WEB_HOST: 0.0.0.0
+      WEB_PORT: 8091
+      WEB_THREADS: 8
+      TZ: Asia/Shanghai
+
+      # ── 定时任务（工作日 北京时间 10:00 触发 run.sh）──
+      DAILY_HOUR: 10
+      DAILY_MINUTE: 0
+      ARXIV_CHECK_CATEGORIES: "eess.AS cs.SD"
+      RUN_SCRIPT: /app/run.sh
+
+      # ── 存储 ──
+      STORAGE_BACKEND: sqlite       # 或 json
+      SQLITE_PATH: /app/data/app.db
+
+      # ── 认证（按需开启）──
+      AUTH_METHODS: local          # local / ldap / local,ldap / ldap,local
+      ALLOW_REGISTER: "false"
+      # 管理接口 token；强烈建议改成随机长串
+      ADMIN_TOKEN: change-me-to-a-long-random-string
+
+      # ── LLM（单次抓取时需要，run.sh 里会读）──
+      # LLM_BASE_URL: https://api.openai.com/v1
+      # LLM_MODEL: gpt-4o
+      # LLM_API_KEY: sk-xxxx
+
+      # ── 对外访问地址（飞书消息、Zotero xpi 会用到）──
+      WEB_PUBLIC_URL: http://127.0.0.1:8091
+
+      # ── LDAP（如启用 ldap 认证方式，取消注释并填好）──
+      # LDAP_URI: ldap://192.168.0.16
+      # LDAP_START_TLS: "false"
+      # LDAP_BASE_DN: dc=ldapdomain,dc=com
+      # LDAP_USER_FILTER: "(uid={username})"
+      # LDAP_BIND_DN: cn=admin,dc=ldapdomain,dc=com
+      # LDAP_BIND_PASSWORD: changeme
+
+    volumes:
+      # 持久化互动数据 / 用户 / 报告 / 论文索引 / secret_key
+      - ./data:/app/data
+      - ./reports:/app/reports
+      - ./logs:/app/logs
+      # 抓取中间产物（PDF 缓存等），可选
+      - arxiv_work:/app/arxiv_digest_work
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8091/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  arxiv_work:

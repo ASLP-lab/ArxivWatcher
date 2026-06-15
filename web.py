@@ -18,6 +18,10 @@
   ADMIN_TOKEN   /admin/* 管理接口的 Bearer token
   WEB_PUBLIC_URL  对外暴露的访问地址，注入到 run.sh 进程供飞书消息使用
   FEISHU_WEBHOOK_URL  飞书 webhook，注入到 run.sh 进程
+  ICP_BEIAN       ICP 备案号（可选）；未设置时页脚不显示备案链接
+  STATIC_CACHE_SECONDS       /static/_h/* 哈希静态资源浏览器与 CDN 缓存秒数，默认 31536000（1 年）
+  IMMUTABLE_CACHE_SECONDS    带 ETag 的不可变内容浏览器缓存秒数，默认 86400（1 天）
+  IMMUTABLE_SMAXAGE_SECONDS  同上内容的 CDN（s-maxage）缓存秒数，默认 604800（7 天）
 
 启动:
     python web.py
@@ -25,15 +29,33 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
+import gzip
 import json
 import logging
 import os
 import re
+
+try:
+    import brotli  # 可选：更优的文本压缩（br）
+    _HAS_BROTLI = True
+except ImportError:  # 未安装时自动退回 gzip
+    brotli = None
+    _HAS_BROTLI = False
 import secrets
 import subprocess
 import sys
 import threading
+# tomllib 是 Python 3.11+ 标准库；3.10 退回 tomli（若装了），否则降级为 None，
+# 下文读 pyproject.toml 取版本号的地方已有 try/except 兜底为 "dev"
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover
+    try:
+        import tomli as tomllib  # type: ignore
+    except ModuleNotFoundError:
+        tomllib = None  # type: ignore
 import time
 import zipfile
 from email.utils import format_datetime
@@ -49,9 +71,51 @@ except ImportError:
 
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, Response, abort, redirect, render_template, request, send_from_directory, url_for
+from flask import Flask, Response, abort, make_response, redirect, render_template, request, send_from_directory, url_for, session, jsonify
+
+import bcrypt
+import markdown as md_lib
+
+import aslp_feed
+import arxiv_version
+import ccf_catalog
+import content_digest
+import static_assets
+import auth
+import storage
 
 ROOT = Path(__file__).resolve().parent
+
+
+def _read_app_version() -> str:
+    try:
+        from importlib.metadata import version as pkg_version
+
+        return pkg_version("arxivwatcher")
+    except Exception:
+        pass
+    if tomllib is None:
+        return "dev"
+    try:
+        # tomllib.load() 同时接受二进制文件对象，兼容 stdlib(3.11+) 与 tomli
+        with open(ROOT / "pyproject.toml", "rb") as f:
+            data = tomllib.load(f)
+        return str(data.get("project", {}).get("version", "dev"))
+    except Exception:
+        return "dev"
+
+
+APP_VERSION = _read_app_version()
+
+DATA_ROOT = ROOT / "data"
+STORAGE_BACKEND = storage.resolve_backend()
+SQLITE_PATH = Path(os.environ.get("SQLITE_PATH") or (DATA_ROOT / storage.DEFAULT_SQLITE_NAME))
+
+
+def _make_store(name: str) -> "storage.Store":
+    return storage.Store(name, data_dir=DATA_ROOT, backend=STORAGE_BACKEND, sqlite_path=SQLITE_PATH)
+
+
 DATA_DIR = ROOT / "data" / "papers"
 REPORTS_DIR = ROOT / "reports"
 TEMPLATES_DIR = ROOT / "templates"
@@ -74,6 +138,28 @@ app = Flask(
     template_folder=str(TEMPLATES_DIR),
     static_folder=str(STATIC_DIR),
 )
+
+SECRET_KEY_FILE = ROOT / "data" / ".secret_key"
+SECRET_KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
+if SECRET_KEY_FILE.exists():
+    app.secret_key = SECRET_KEY_FILE.read_text().strip()
+else:
+    app.secret_key = secrets.token_hex(32)
+    SECRET_KEY_FILE.write_text(app.secret_key)
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
+
+
+def current_user() -> Optional[str]:
+    return session.get("username")
+
+
+def require_user() -> str:
+    u = current_user()
+    if not u:
+        abort(401)
+    return u
 
 
 def _admin_auth_error():
@@ -343,103 +429,229 @@ def build_rss_xml(*, base_url: str, papers: list[dict], category: str = "") -> s
 # 仅在用户实际看到的页面端点上累加，避免重复计算 redirect / iframe / 静态资源 / API。
 # ─────────────────────────────────────────────
 
-VISITS_FILE = ROOT / "data" / "visits.json"
-_visits_data: dict = {}
-_visits_loaded: bool = False
+VISITOR_COOKIE_NAME = "arxiv_visitor_id"
+VISITOR_COOKIE_MAX_AGE = 60 * 60 * 24 * 400
+_visits_store = _make_store("visits")
 _visits_lock = threading.Lock()
 
 
-def _load_visits_file() -> dict:
-    if not VISITS_FILE.exists():
-        return {}
-    try:
-        data = json.loads(VISITS_FILE.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            return data
-    except Exception as e:
-        log.warning(f"加载 {VISITS_FILE} 失败: {e}")
-    return {}
-
-
-def _save_visits_file(data: dict) -> None:
-    try:
-        VISITS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = VISITS_FILE.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(VISITS_FILE)
-    except Exception as e:
-        log.warning(f"保存 {VISITS_FILE} 失败: {e}")
-
-
-def _ensure_visits_loaded() -> None:
-    global _visits_loaded, _visits_data
-    if not _visits_loaded:
-        _visits_data = _load_visits_file()
-        _visits_loaded = True
-
-
 def _normalize_day(day: dict) -> dict:
-    """统一每日数据结构为 {"total": int, "hourly": [24 ints]}。"""
+    """统一每日访问数据结构，兼容旧版本只包含 PV 的记录。"""
     hourly = day.get("hourly")
     if isinstance(hourly, dict):
         hourly = [int(hourly.get(f"{h:02d}", 0) or 0) for h in range(24)]
     if not isinstance(hourly, list) or len(hourly) != 24:
         hourly = [0] * 24
     day["hourly"] = [int(x or 0) for x in hourly]
-    day["total"] = int(day.get("total") or 0)
+    users = day.get("users")
+    if isinstance(users, dict):
+        users = list(users.keys())
+    if not isinstance(users, list):
+        users = []
+    day["users"] = sorted({str(u) for u in users if u})
+
+    tabs = day.get("tabs")
+    if isinstance(tabs, dict):
+        tabs = list(tabs.keys())
+    if not isinstance(tabs, list):
+        tabs = []
+    day["tabs"] = sorted({str(t) for t in tabs if t})
+
+    day["active_users"] = len(day["users"])
+    if day["tabs"]:
+        day["total"] = len(day["tabs"])
+    else:
+        day["total"] = int(day.get("total") or 0)
     return day
 
 
-def record_visit() -> None:
-    """累加一次访问到当前北京时间所在小时。"""
+def _make_visitor_id() -> str:
+    return secrets.token_urlsafe(24)
+
+
+def _valid_visitor_id(value: str) -> bool:
+    return 16 <= len(value) <= 256
+
+
+def _hash_visitor_id(visitor_id: str) -> str:
+    return hashlib.sha256(visitor_id.encode("utf-8")).hexdigest()
+
+
+def _valid_tab_id(value: str) -> bool:
+    return 8 <= len(value) <= 128
+
+
+def _hash_tab_key(visitor_id: str, tab_id: str) -> str:
+    return hashlib.sha256(f"{visitor_id}:{tab_id}".encode("utf-8")).hexdigest()
+
+
+def record_tab_visit(visitor_id: str, tab_id: str) -> bool:
+    """按 tab 计访问：同一 tab 当天只计 1 次；活跃用户按 visitor 去重。"""
     now = datetime.now(BJ_TZ)
     date_str = now.strftime("%Y-%m-%d")
     hour_idx = now.hour
+    visitor_hash = _hash_visitor_id(visitor_id)
+    tab_hash = _hash_tab_key(visitor_id, tab_id)
     with _visits_lock:
-        _ensure_visits_loaded()
-        day = _visits_data.setdefault(date_str, {"total": 0, "hourly": [0] * 24})
+        _visits_data = _visits_store.all()
+        day = _visits_data.setdefault(date_str, {"total": 0, "hourly": [0] * 24, "users": [], "tabs": []})
         _normalize_day(day)
-        day["total"] += 1
+
+        tabs = set(day.get("tabs") or [])
+        if not tabs and int(day.get("total") or 0) > 0:
+            # 兼容旧版只有 total 的数据：保留历史基数，后续按新 tab 继续增长。
+            tabs = {f"legacy-{i}" for i in range(int(day.get("total") or 0))}
+        if tab_hash in tabs:
+            return False
+        tabs.add(tab_hash)
+        day["tabs"] = sorted(tabs)
+        day["total"] = len(tabs)
         day["hourly"][hour_idx] += 1
-        _save_visits_file(_visits_data)
+
+        users = set(day.get("users") or [])
+        users.add(visitor_hash)
+        day["users"] = sorted(users)
+        day["active_users"] = len(users)
+
+        _visits_store.put(date_str, day)
+        return True
 
 
 def get_today_visit_total() -> int:
     today = datetime.now(BJ_TZ).strftime("%Y-%m-%d")
     with _visits_lock:
-        _ensure_visits_loaded()
-        return int((_visits_data.get(today) or {}).get("total", 0))
+        return int((_visits_store.get(today) or {}).get("total", 0))
+
+
+def get_today_active_user_total() -> int:
+    today = datetime.now(BJ_TZ).strftime("%Y-%m-%d")
+    with _visits_lock:
+        day = _visits_store.get(today) or {}
+        return int(_normalize_day(dict(day)).get("active_users", 0))
 
 
 def get_grand_visit_total() -> int:
     with _visits_lock:
-        _ensure_visits_loaded()
-        return int(sum(int((d or {}).get("total", 0)) for d in _visits_data.values()))
+        return int(sum(int((d or {}).get("total", 0)) for d in _visits_store.all().values()))
 
 
-def get_visits_snapshot() -> dict:
+def get_visits_snapshot(*, include_users: bool = False) -> dict:
     with _visits_lock:
-        _ensure_visits_loaded()
         out: dict = {}
-        for k, v in _visits_data.items():
-            out[k] = _normalize_day(dict(v or {}))
+        for k, v in _visits_store.all().items():
+            day = _normalize_day(dict(v or {}))
+            if not include_users:
+                day.pop("users", None)
+                day.pop("tabs", None)
+            out[k] = day
         return out
 
 
-COUNTED_ENDPOINTS = {
-    "index", "view_date", "history", "search",
-    "rss_page", "zotero_plugin_page",
-}
+# ─────────────────────────────────────────────
+# 用户认证（bcrypt + Flask session）
+# ─────────────────────────────────────────────
+
+_users_store = _make_store("users")
+_users_lock = threading.Lock()
 
 
-@app.after_request
-def _count_visit(response):
-    if request.endpoint in COUNTED_ENDPOINTS and 200 <= response.status_code < 300:
-        try:
-            record_visit()
-        except Exception as e:
-            log.warning(f"记录访问失败: {e}")
-    return response
+def _get_users() -> dict:
+    return _users_store.all()
+
+
+def _ensure_ldap_user(username: str) -> None:
+    """LDAP 登录成功后，确保本地有一条记录（占位、标记来源），避免与本地账号混淆。"""
+    with _users_lock:
+        users = _get_users()
+        if username not in users:
+            users[username] = {
+                "source": "ldap",
+                "created_at": datetime.now(BJ_TZ).isoformat(),
+            }
+            _users_store.put(username, users[username])
+
+
+def authenticate(username: str, password: str) -> tuple[bool, str]:
+    """按 AUTH_METHODS 配置的优先级依次尝试认证。返回 (是否成功, 失败原因)。"""
+    last_msg = "用户名或密码错误"
+    for method in auth.auth_methods():
+        if method == "local":
+            with _users_lock:
+                user = _get_users().get(username)
+            pwd_hash = user.get("password_hash") if user else None
+            if pwd_hash and bcrypt.checkpw(password.encode("utf-8"), pwd_hash.encode("utf-8")):
+                return True, ""
+        elif method == "ldap":
+            ok, msg = auth.ldap_authenticate(username, password)
+            if ok:
+                _ensure_ldap_user(username)
+                return True, ""
+            if msg:
+                last_msg = msg
+    return False, last_msg
+
+
+# ─────────────────────────────────────────────
+# 互动数据（赞/踩、评论、标记、收藏）
+# ─────────────────────────────────────────────
+
+DEFAULT_FAVORITE_FOLDER = "默认收藏"
+
+_interactions_store = _make_store("interactions")
+_interactions_lock = threading.Lock()
+
+_comments_store = _make_store("comments")
+_comments_lock = threading.Lock()
+
+_highlights_store = _make_store("highlights")
+_highlights_lock = threading.Lock()
+
+_favorites_store = _make_store("favorites")
+_favorites_lock = threading.Lock()
+
+_arxiv_versions_store = _make_store("arxiv_versions")
+_arxiv_version_cache = arxiv_version.ArxivVersionCache(_arxiv_versions_store)
+
+
+def _get_interactions() -> dict:
+    return _interactions_store.all()
+
+
+def _get_comments() -> dict:
+    return _comments_store.all()
+
+
+def _get_highlights() -> dict:
+    return _highlights_store.all()
+
+
+def _get_favorites() -> dict:
+    return _favorites_store.all()
+
+
+def _get_user_favorites(data: dict, username: str) -> dict:
+    """获取（并按需初始化）某用户的收藏结构。"""
+    entry = data.setdefault(username, {})
+    folders = entry.setdefault("folders", [])
+    if DEFAULT_FAVORITE_FOLDER not in folders:
+        folders.insert(0, DEFAULT_FAVORITE_FOLDER)
+    entry.setdefault("items", {})
+    return entry
+
+
+def _interaction_key(date: str, paper_id: str) -> str:
+    return f"{date}/{paper_id}"
+
+
+def _get_voter_identity() -> str:
+    """Get voter identity: username if logged in, otherwise visitor cookie hash."""
+    username = current_user()
+    if username:
+        return f"user:{username}"
+    visitor_id = (request.cookies.get(VISITOR_COOKIE_NAME) or "").strip()
+    if not _valid_visitor_id(visitor_id):
+        return ""
+    return f"anon:{_hash_visitor_id(visitor_id)}"
 
 
 # ─────────────────────────────────────────────
@@ -498,14 +710,944 @@ def search_papers(
 # 路由
 # ─────────────────────────────────────────────
 
+STATIC_CACHE_SECONDS = int(os.environ.get("STATIC_CACHE_SECONDS", str(365 * 24 * 3600)))
+static_assets.init(STATIC_DIR)
+static_assets.refresh()
+IMMUTABLE_CACHE_SECONDS = int(os.environ.get("IMMUTABLE_CACHE_SECONDS", str(24 * 3600)))
+IMMUTABLE_SMAXAGE_SECONDS = int(os.environ.get("IMMUTABLE_SMAXAGE_SECONDS", str(7 * 24 * 3600)))
+
+
+def _immutable_cache_control(*, stale_while_revalidate: int = 86400) -> str:
+    """不可变内容（按文件 mtime 做 ETag）：浏览器 + CDN 均可长期缓存。"""
+    return (
+        f"public, max-age={IMMUTABLE_CACHE_SECONDS}, "
+        f"s-maxage={IMMUTABLE_SMAXAGE_SECONDS}, "
+        f"stale-while-revalidate={stale_while_revalidate}"
+    )
+
+
+def _apply_304_cache(resp: Response) -> Response:
+    resp.headers["Cache-Control"] = _immutable_cache_control()
+    return resp
+
+
+def _apply_no_cdn_cache(resp: Response) -> Response:
+    """易变内容：浏览器可校验，CDN 边缘不长期缓存。"""
+    resp.headers["Cache-Control"] = "private, no-cache, must-revalidate"
+    resp.headers["CDN-Cache-Control"] = "no-store"
+    resp.headers["Surrogate-Control"] = "no-store"
+    return resp
+
+
+def _apply_hashed_content_cache(resp: Response) -> Response:
+    """内容寻址 API / 静态资源：哈希在 URL 中，可长期 CDN + 浏览器缓存。"""
+    resp.headers["Cache-Control"] = (
+        f"public, max-age={STATIC_CACHE_SECONDS}, "
+        f"s-maxage={STATIC_CACHE_SECONDS}, immutable"
+    )
+    return resp
+
+
 @app.context_processor
 def inject_globals():
+    icp_beian = os.environ.get("ICP_BEIAN", "").strip()
     return {
         "now_bj": datetime.now(BJ_TZ),
         "all_dates": list_all_dates(),
         "today_visits": get_today_visit_total(),
+        "today_active_users": get_today_active_user_total(),
         "total_visits": get_grand_visit_total(),
+        "current_user": current_user(),
+        "static_asset": lambda name: url_for("static", filename=static_assets.get_rel(name)),
+        "allow_register": auth.registration_enabled(),
+        "ldap_enabled": auth.ldap_enabled(),
+        "icp_beian": icp_beian,
+        "app_version": APP_VERSION,
     }
+
+
+# 可被压缩的响应类型（JSON / 文本 / JS / CSS / XML / SVG）
+_COMPRESSIBLE_PREFIXES = ("application/json", "text/", "application/xml", "image/svg")
+
+# 不可变响应（带强 ETag 的 papers/analysis 等）压缩结果缓存：key=(etag, encoding)
+_compress_cache: dict = {}
+_compress_cache_lock = threading.Lock()
+_COMPRESS_CACHE_MAX = 512
+
+
+def _pick_encoding(accept: str) -> Optional[str]:
+    """按客户端 Accept-Encoding 协商压缩算法：优先 br，回退 gzip。"""
+    accept = (accept or "").lower()
+    if _HAS_BROTLI and "br" in accept:
+        return "br"
+    if "gzip" in accept:
+        return "gzip"
+    return None
+
+
+def _compress_bytes(data: bytes, encoding: str, best: bool) -> bytes:
+    """best=True 用最高压缩比（用于已缓存的不可变内容），否则用较快级别。"""
+    if encoding == "br":
+        return brotli.compress(data, quality=(11 if best else 5))
+    return gzip.compress(data, compresslevel=(9 if best else 6))
+
+
+@app.after_request
+def _compress_response(response: Response) -> Response:
+    """对较大的文本类响应做 br/gzip 压缩。
+    不可变内容（带强 ETag + public 缓存）只压一次并按 ETag 缓存压缩字节、且用最高压缩比。
+    """
+    try:
+        encoding = _pick_encoding(request.headers.get("Accept-Encoding", ""))
+        if not encoding:
+            return response
+        if response.direct_passthrough or response.status_code >= 300:
+            return response
+        if response.headers.get("Content-Encoding"):
+            return response
+        ct = (response.content_type or "")
+        if not (ct.startswith(_COMPRESSIBLE_PREFIXES) or "javascript" in ct):
+            return response
+        data = response.get_data()
+        if len(data) < 1024:  # 太小压缩反而不划算
+            return response
+
+        etag = response.get_etag()[0]
+        # 带强 ETag 的内容（papers/analysis）内容唯一，压缩结果按 ETag 缓存复用
+        cacheable = bool(etag)
+
+        compressed = None
+        if cacheable:
+            key = (etag, encoding)
+            with _compress_cache_lock:
+                compressed = _compress_cache.get(key)
+            if compressed is None:
+                compressed = _compress_bytes(data, encoding, best=True)
+                with _compress_cache_lock:
+                    if len(_compress_cache) >= _COMPRESS_CACHE_MAX:
+                        _compress_cache.clear()
+                    _compress_cache[key] = compressed
+        else:
+            compressed = _compress_bytes(data, encoding, best=False)
+
+        response.set_data(compressed)
+        response.headers["Content-Encoding"] = encoding
+        response.headers["Content-Length"] = str(len(compressed))
+        if "accept-encoding" not in (response.headers.get("Vary", "") or "").lower():
+            response.headers.add("Vary", "Accept-Encoding")
+    except Exception as e:  # 压缩失败时退回原始响应
+        log.debug(f"压缩跳过: {e}")
+    return response
+
+
+@app.after_request
+def _set_cache_headers(response: Response) -> Response:
+    """按路径类型设置 CDN / 浏览器缓存策略（未显式设置 Cache-Control 时生效）。"""
+    if response.status_code >= 400:
+        return response
+
+    path = request.path
+
+    # 内容哈希 API / 静态资源：URL 含 digest，可长期 CDN + 浏览器缓存
+    if content_digest.is_hashed_api_path(path) or static_assets.is_hashed_static_path(path):
+        return _apply_hashed_content_cache(response)
+
+    # 未哈希的 /static/*（直连源文件）：短缓存，避免与哈希副本不一致
+    if path.startswith("/static/"):
+        response.headers["Cache-Control"] = "public, max-age=3600"
+        return response
+
+    if response.headers.get("Cache-Control"):
+        return response
+
+    ct = response.content_type or ""
+
+    # HTML 含登录态，禁止共享 CDN 缓存
+    if ct.startswith("text/html"):
+        response.headers["Cache-Control"] = "private, no-cache"
+        response.headers.add("Vary", "Cookie")
+        return response
+
+    # 用户相关 / 写操作 API：不缓存
+    if path.startswith(("/auth/", "/admin/")) or request.method != "GET":
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
+
+    dynamic_api_prefixes = (
+        "/api/interactions/",
+        "/api/papers-digest/",
+        "/api/comments",
+        "/api/comment",
+        "/api/favorites",
+        "/api/favorite",
+        "/api/highlights",
+        "/api/highlights-community",
+        "/api/highlight",
+        "/api/tab-visit",
+        "/api/visits",
+        "/api/search",
+    )
+    if path.startswith(dynamic_api_prefixes):
+        response.headers["Cache-Control"] = "private, no-cache"
+        response.headers.add("Vary", "Cookie")
+        return response
+
+    # 实验室动态：每小时刷新，禁止 CDN 共享缓存（避免边缘节点长期返回旧条目）
+    if path == "/api/lab-feed":
+        return _apply_no_cdn_cache(response)
+
+    # RSS：中等缓存
+    if path == "/rss/feed.xml":
+        response.headers["Cache-Control"] = "public, max-age=600, s-maxage=3600"
+        return response
+
+    return response
+
+
+# ─────────────────────────────────────────────
+# 认证路由
+# ─────────────────────────────────────────────
+
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,32}$")
+
+
+@app.route("/auth/register", methods=["POST"])
+def auth_register():
+    if not auth.registration_enabled():
+        return jsonify({"ok": False, "msg": "本站已关闭注册"}), 403
+    payload = request.get_json(silent=True) or {}
+    username = str(payload.get("username") or "").strip()
+    password = str(payload.get("password") or "")
+    if not _USERNAME_RE.fullmatch(username):
+        return jsonify({"ok": False, "msg": "用户名需 3-32 位字母、数字或下划线"}), 400
+    if len(password) < 6:
+        return jsonify({"ok": False, "msg": "密码至少 6 位"}), 400
+    with _users_lock:
+        users = _get_users()
+        if username in users:
+            return jsonify({"ok": False, "msg": "用户名已存在"}), 409
+        users[username] = {
+            "password_hash": bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8"),
+            "created_at": datetime.now(BJ_TZ).isoformat(),
+        }
+        _users_store.put(username, users[username])
+    session.permanent = True
+    session["username"] = username
+    return jsonify({"ok": True, "username": username})
+
+
+@app.route("/auth/login", methods=["POST"])
+def auth_login():
+    payload = request.get_json(silent=True) or {}
+    username = str(payload.get("username") or "").strip()
+    password = str(payload.get("password") or "")
+    if not auth.valid_login_name(username) or not password:
+        return jsonify({"ok": False, "msg": "用户名或密码错误"}), 401
+    ok, msg = authenticate(username, password)
+    if not ok:
+        return jsonify({"ok": False, "msg": msg or "用户名或密码错误"}), 401
+    session.permanent = True
+    session["username"] = username
+    return jsonify({"ok": True, "username": username})
+
+
+@app.route("/auth/logout", methods=["POST"])
+def auth_logout():
+    session.pop("username", None)
+    return jsonify({"ok": True})
+
+
+@app.route("/auth/me")
+def auth_me():
+    username = current_user()
+    if username:
+        return jsonify({"ok": True, "username": username})
+    return jsonify({"ok": True, "username": None})
+
+
+# ─────────────────────────────────────────────
+# 论文数据 API（动态渲染）
+# ─────────────────────────────────────────────
+
+def _find_paper(index: dict, paper_id: str) -> Optional[dict]:
+    for p in index.get("papers", []):
+        if str(p.get("paper_id")) == str(paper_id):
+            return p
+    return None
+
+
+@app.route("/api/ccf-catalog")
+def api_ccf_catalog_meta():
+    """返回 CCF 目录内容哈希与可长期缓存的 URL。"""
+    ccf_catalog.ensure_fresh()
+    digest = ccf_catalog.get_digest()
+    if not digest:
+        return jsonify({"ok": False, "msg": "CCF 目录暂不可用"}), 503
+    return _apply_no_cdn_cache(jsonify({
+        "ok": True,
+        "digest": digest,
+        "url": url_for("api_ccf_catalog_hashed", digest=digest),
+        "source": ccf_catalog.CCF_PAGE_URL,
+    }))
+
+
+@app.route("/api/h/<digest>/ccf-catalog")
+def api_ccf_catalog_hashed(digest: str):
+    """内容寻址：CCF 推荐会议/期刊目录（供前端 Comments 匹配）。"""
+    ccf_catalog.ensure_fresh()
+    expected = ccf_catalog.get_digest()
+    if not expected or digest != expected:
+        abort(404)
+    entries = [
+        {
+            "s": e["s"],
+            "f": e["f"],
+            "r": e["r"],
+            "t": e["t"],
+            "type_label": e["type_label"],
+            "area_label": e["area_label"],
+        }
+        for e in ccf_catalog.get_entries()
+    ]
+    return _apply_hashed_content_cache(jsonify({
+        "ok": True,
+        "digest": digest,
+        "entries": entries,
+    }))
+
+
+@app.route("/api/papers-digest/<date>")
+def api_papers_digest(date: str):
+    """返回某日论文列表的内容哈希（短缓存，供收藏页等动态拼 hashed URL）。"""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        abort(404)
+    index = load_index(date)
+    if not index:
+        abort(404)
+    digest = content_digest.papers_list_digest(index)
+    resp = jsonify({
+        "ok": True,
+        "digest": digest,
+        "url": url_for("api_papers_hashed", digest=digest, date=date),
+    })
+    return _apply_no_cdn_cache(resp)
+
+
+@app.route("/api/h/<digest>/paper/<date>/<paper_id>")
+def api_single_paper_hashed(digest: str, date: str, paper_id: str):
+    """内容寻址：单篇论文元数据（分享页用，可长期 CDN 缓存）。"""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        abort(404)
+    index = load_index(date)
+    if not index:
+        abort(404)
+    target = _find_paper(index, paper_id)
+    if target is None:
+        return jsonify({"ok": False, "msg": "paper not found"}), 404
+    expected = content_digest.single_paper_digest(target)
+    if digest != expected:
+        abort(404)
+    return _apply_hashed_content_cache(
+        jsonify(content_digest.build_single_paper_payload(target))
+    )
+
+
+@app.route("/api/h/<digest>/papers/<date>")
+def api_papers_hashed(digest: str, date: str):
+    """内容寻址：某日论文列表（不含精读正文）。"""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        abort(404)
+    index = load_index(date)
+    if not index:
+        abort(404)
+    expected = content_digest.papers_list_digest(index)
+    if digest != expected:
+        abort(404)
+    return _apply_hashed_content_cache(jsonify(content_digest.build_papers_list_payload(index)))
+
+
+@app.route("/api/h/<digest>/analysis/<date>/<paper_id>")
+def api_analysis_hashed(digest: str, date: str, paper_id: str):
+    """内容寻址：单篇论文精读 HTML。"""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        abort(404)
+    index = load_index(date)
+    if not index:
+        abort(404)
+    target = _find_paper(index, paper_id)
+    if target is None:
+        return jsonify({"ok": False, "msg": "paper not found"}), 404
+    expected = content_digest.paper_analysis_digest(target)
+    if not expected or digest != expected:
+        abort(404)
+    html = content_digest.build_analysis_html(target)
+    return _apply_hashed_content_cache(jsonify({"ok": True, "analysis_html": html}))
+
+
+@app.route("/api/papers/<date>")
+def api_papers(date: str):
+    """兼容旧客户端；请改用 /api/h/<digest>/papers/<date>。"""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        abort(404)
+    index = load_index(date)
+    if not index:
+        abort(404)
+    return _apply_no_cdn_cache(jsonify(content_digest.build_papers_list_payload(index)))
+
+
+@app.route("/api/analysis/<date>/<paper_id>")
+def api_analysis(date: str, paper_id: str):
+    """兼容旧客户端；请改用 /api/h/<digest>/analysis/<date>/<paper_id>。"""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        abort(404)
+    index = load_index(date)
+    if not index:
+        abort(404)
+    target = _find_paper(index, paper_id)
+    if target is None:
+        return jsonify({"ok": False, "msg": "paper not found"}), 404
+    html = content_digest.build_analysis_html(target)
+    return _apply_no_cdn_cache(jsonify({"ok": True, "analysis_html": html}))
+
+
+# ─────────────────────────────────────────────
+# 赞/踩 API
+# ─────────────────────────────────────────────
+
+@app.route("/api/like", methods=["POST"])
+def api_like():
+    payload = request.get_json(silent=True) or {}
+    date = str(payload.get("date") or "").strip()
+    paper_id = str(payload.get("paper_id") or "").strip()
+    if not date or not paper_id:
+        return jsonify({"ok": False, "msg": "missing date or paper_id"}), 400
+    voter = _get_voter_identity()
+    if not voter:
+        return jsonify({"ok": False, "msg": "需要 cookie 或登录才能投票"}), 401
+    key = _interaction_key(date, paper_id)
+    with _interactions_lock:
+        data = _get_interactions()
+        entry = data.setdefault(key, {"likes": 0, "dislikes": 0, "liked_by": {}, "disliked_by": {}})
+        # 取消之前的踩
+        if voter in entry.get("disliked_by", {}):
+            del entry["disliked_by"][voter]
+            entry["dislikes"] = max(0, entry.get("dislikes", 0) - 1)
+        # 切换赞
+        if voter in entry.get("liked_by", {}):
+            del entry["liked_by"][voter]
+            entry["likes"] = max(0, entry.get("likes", 0) - 1)
+            user_liked = False
+        else:
+            entry.setdefault("liked_by", {})[voter] = True
+            entry["likes"] = entry.get("likes", 0) + 1
+            user_liked = True
+        _interactions_store.put(key, entry)
+    return jsonify({
+        "ok": True, "likes": entry["likes"], "dislikes": entry["dislikes"],
+        "user_liked": user_liked, "user_disliked": False,
+    })
+
+
+@app.route("/api/dislike", methods=["POST"])
+def api_dislike():
+    payload = request.get_json(silent=True) or {}
+    date = str(payload.get("date") or "").strip()
+    paper_id = str(payload.get("paper_id") or "").strip()
+    if not date or not paper_id:
+        return jsonify({"ok": False, "msg": "missing date or paper_id"}), 400
+    voter = _get_voter_identity()
+    if not voter:
+        return jsonify({"ok": False, "msg": "需要 cookie 或登录才能投票"}), 401
+    key = _interaction_key(date, paper_id)
+    with _interactions_lock:
+        data = _get_interactions()
+        entry = data.setdefault(key, {"likes": 0, "dislikes": 0, "liked_by": {}, "disliked_by": {}})
+        # 取消之前的赞
+        if voter in entry.get("liked_by", {}):
+            del entry["liked_by"][voter]
+            entry["likes"] = max(0, entry.get("likes", 0) - 1)
+        # 切换踩
+        if voter in entry.get("disliked_by", {}):
+            del entry["disliked_by"][voter]
+            entry["dislikes"] = max(0, entry.get("dislikes", 0) - 1)
+            user_disliked = False
+        else:
+            entry.setdefault("disliked_by", {})[voter] = True
+            entry["dislikes"] = entry.get("dislikes", 0) + 1
+            user_disliked = True
+        _interactions_store.put(key, entry)
+    return jsonify({
+        "ok": True, "likes": entry["likes"], "dislikes": entry["dislikes"],
+        "user_liked": False, "user_disliked": user_disliked,
+    })
+
+
+@app.route("/api/interactions/<date>")
+def api_interactions(date: str):
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        abort(404)
+    voter = _get_voter_identity()
+    result: dict = {}
+    prefix = date + "/"
+    with _comments_lock:
+        comments_data = _get_comments()
+        comment_counts = {
+            key[len(prefix):]: len(comments)
+            for key, comments in comments_data.items()
+            if key.startswith(prefix)
+        }
+    with _interactions_lock:
+        data = _get_interactions()
+        for key, entry in data.items():
+            if key.startswith(prefix):
+                pid = key[len(prefix):]
+                result[pid] = {
+                    "likes": entry.get("likes", 0),
+                    "dislikes": entry.get("dislikes", 0),
+                    "user_liked": voter in entry.get("liked_by", {}),
+                    "user_disliked": voter in entry.get("disliked_by", {}),
+                    "comment_count": comment_counts.get(pid, 0),
+                }
+    # 仅有评论、没有赞踩记录的论文也要带上评论数
+    for pid, cnt in comment_counts.items():
+        if pid not in result:
+            result[pid] = {
+                "likes": 0,
+                "dislikes": 0,
+                "user_liked": False,
+                "user_disliked": False,
+                "comment_count": cnt,
+            }
+    return jsonify({"ok": True, "interactions": result})
+
+
+# ─────────────────────────────────────────────
+# 评论 API
+# ─────────────────────────────────────────────
+
+@app.route("/api/comment", methods=["POST"])
+def api_comment_post():
+    username = require_user()
+    payload = request.get_json(silent=True) or {}
+    date = str(payload.get("date") or "").strip()
+    paper_id = str(payload.get("paper_id") or "").strip()
+    text = str(payload.get("text") or "").strip()
+    if not date or not paper_id:
+        return jsonify({"ok": False, "msg": "missing date or paper_id"}), 400
+    if not text or len(text) > 50:
+        return jsonify({"ok": False, "msg": "评论内容 1-50 字"}), 400
+    key = _interaction_key(date, paper_id)
+    comment_id = secrets.token_urlsafe(12)
+    comment = {
+        "id": comment_id,
+        "username": username,
+        "text": text,
+        "created_at": datetime.now(BJ_TZ).isoformat(),
+    }
+    with _comments_lock:
+        data = _get_comments()
+        data.setdefault(key, []).append(comment)
+        _comments_store.put(key, data[key])
+    return jsonify({"ok": True, "comment": comment})
+
+
+@app.route("/api/comment/<comment_id>", methods=["DELETE"])
+def api_comment_delete(comment_id: str):
+    username = require_user()
+    with _comments_lock:
+        data = _get_comments()
+        for key, comments in data.items():
+            for i, c in enumerate(comments):
+                if c.get("id") == comment_id and c.get("username") == username:
+                    comments.pop(i)
+                    _comments_store.put(key, comments)
+                    return jsonify({"ok": True})
+    return jsonify({"ok": False, "msg": "评论不存在或无权删除"}), 404
+
+
+@app.route("/api/comments/<date>/<paper_id>")
+def api_comments_get(date: str, paper_id: str):
+    key = _interaction_key(date, paper_id)
+    with _comments_lock:
+        data = _get_comments()
+        comments = data.get(key, [])
+    return jsonify({"ok": True, "comments": comments})
+
+
+@app.route("/api/comments-all/<date>")
+def api_comments_all(date: str):
+    """一次性返回某天全部论文的评论（按 paper_id 分组），供默认展开评论时批量加载。"""
+    prefix = f"{date}/"
+    out: dict = {}
+    with _comments_lock:
+        data = _get_comments()
+        for key, comments in data.items():
+            if key.startswith(prefix) and comments:
+                out[key[len(prefix):]] = comments
+    return jsonify({"ok": True, "comments": out})
+
+
+# ─────────────────────────────────────────────
+# 标记（沉浸式阅读）API
+# ─────────────────────────────────────────────
+
+@app.route("/api/highlight", methods=["POST"])
+def api_highlight_post():
+    username = require_user()
+    payload = request.get_json(silent=True) or {}
+    date = str(payload.get("date") or "").strip()
+    paper_id = str(payload.get("paper_id") or "").strip()
+    text = str(payload.get("text") or "").strip()
+    color = str(payload.get("color") or "#fef08a").strip()
+    if not date or not paper_id:
+        return jsonify({"ok": False, "msg": "missing date or paper_id"}), 400
+    if not text or len(text) > 500:
+        return jsonify({"ok": False, "msg": "标记文本 1-500 字"}), 400
+    highlight_id = secrets.token_urlsafe(12)
+    comment = _parse_highlight_comment(payload)
+    highlight = {
+        "id": highlight_id,
+        "text": text,
+        "color": color,
+        "comment": comment,
+        "created_at": datetime.now(BJ_TZ).isoformat(),
+    }
+    if comment:
+        highlight["comment_updated_at"] = highlight["created_at"]
+    with _highlights_lock:
+        data = _get_highlights()
+        user_key = username
+        paper_key = _interaction_key(date, paper_id)
+        data.setdefault(user_key, {}).setdefault(paper_key, []).append(highlight)
+        _highlights_store.put(user_key, data[user_key])
+    return jsonify({"ok": True, "highlight": highlight})
+
+
+def _parse_highlight_comment(payload: dict) -> str:
+    """从请求体解析标记评论，超长时截断而非报错（避免 CDN/客户端差异导致 400）。"""
+    raw = payload.get("comment")
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        return ""
+    comment = raw.strip()
+    if len(comment) > 200:
+        comment = comment[:200]
+    return comment
+
+
+def _update_highlight_comment(username: str, highlight_id: str, comment: str) -> Optional[dict]:
+    with _highlights_lock:
+        data = _get_highlights()
+        user_data = data.get(username, {})
+        for highlights in user_data.values():
+            for h in highlights:
+                if h.get("id") == highlight_id:
+                    h["comment"] = comment
+                    if comment:
+                        h["comment_updated_at"] = datetime.now(BJ_TZ).isoformat()
+                    else:
+                        h.pop("comment_updated_at", None)
+                    _highlights_store.put(username, user_data)
+                    return h
+    return None
+
+
+@app.route("/api/highlight/<highlight_id>/comment", methods=["POST"])
+def api_highlight_comment_post(highlight_id: str):
+    """更新标记评论（POST，兼容 CDN 对 PATCH 的限制）。"""
+    username = require_user()
+    payload = request.get_json(silent=True) or {}
+    comment = _parse_highlight_comment(payload)
+    h = _update_highlight_comment(username, highlight_id, comment)
+    if h is None:
+        return jsonify({"ok": False, "msg": "标记不存在或无权修改"}), 404
+    return jsonify({"ok": True, "highlight": h})
+
+
+@app.route("/api/highlight/<highlight_id>", methods=["PATCH", "POST"])
+def api_highlight_patch(highlight_id: str):
+    """更新标记评论（PATCH 保留兼容；POST 需带 comment 字段）。"""
+    username = require_user()
+    payload = request.get_json(silent=True) or {}
+    if request.method == "POST" and "comment" not in payload:
+        return jsonify({"ok": False, "msg": "missing comment"}), 400
+    comment = _parse_highlight_comment(payload)
+    h = _update_highlight_comment(username, highlight_id, comment)
+    if h is None:
+        return jsonify({"ok": False, "msg": "标记不存在或无权修改"}), 404
+    return jsonify({"ok": True, "highlight": h})
+
+
+@app.route("/api/highlight/<highlight_id>", methods=["DELETE"])
+def api_highlight_delete(highlight_id: str):
+    username = require_user()
+    with _highlights_lock:
+        data = _get_highlights()
+        user_data = data.get(username, {})
+        for paper_key, highlights in list(user_data.items()):
+            for i, h in enumerate(highlights):
+                if h.get("id") == highlight_id:
+                    highlights.pop(i)
+                    if not highlights:
+                        del user_data[paper_key]
+                    _highlights_store.put(username, user_data)
+                    return jsonify({"ok": True})
+    return jsonify({"ok": False, "msg": "标记不存在或无权删除"}), 404
+
+
+@app.route("/api/arxiv-version/<date>/<paper_id>")
+def api_arxiv_version(date: str, paper_id: str):
+    """arXiv 论文当前版本（服务端拉 abs 页，按 日期/arXiv号 永久缓存到 SQLite）。"""
+    base_id = arxiv_version.normalize_base_id(paper_id)
+    if not arxiv_version.is_arxiv_base_id(base_id):
+        return jsonify({"ok": False, "msg": "无效的 arXiv ID"}), 400
+    try:
+        ver, from_cache = _arxiv_version_cache.get_version(date, paper_id)
+    except Exception as exc:
+        log.warning(
+            "arxiv version fetch failed for %s: %s",
+            arxiv_version.cache_key(date, paper_id),
+            exc,
+        )
+        return jsonify({"ok": False, "msg": "无法获取 arXiv 版本"}), 502
+    resp = make_response(
+        jsonify({
+            "ok": True,
+            "version": ver,
+            "date": date,
+            "paper_id": paper_id,
+            "cached": from_cache,
+        })
+    )
+    resp.headers["Cache-Control"] = "public, max-age=86400, s-maxage=86400"
+    return resp
+
+
+@app.route("/api/highlights-community/<date>/<paper_id>")
+def api_highlights_community(date: str, paper_id: str):
+    """某篇论文上所有用户标记过的文本（去重），不暴露标注者身份。"""
+    paper_key = _interaction_key(date, paper_id)
+    seen: set[str] = set()
+    marks: list[dict] = []
+    with _highlights_lock:
+        data = _get_highlights()
+        for user_data in data.values():
+            for h in user_data.get(paper_key, []):
+                text = str(h.get("text") or "").strip()
+                if not text or text in seen:
+                    continue
+                seen.add(text)
+                marks.append({"text": text})
+    return jsonify({"ok": True, "marks": marks})
+
+
+@app.route("/api/highlights/<date>/<paper_id>")
+def api_highlights_get(date: str, paper_id: str):
+    username = current_user()
+    if not username:
+        return jsonify({"ok": False, "msg": "需要登录"}), 401
+    paper_key = _interaction_key(date, paper_id)
+    with _highlights_lock:
+        data = _get_highlights()
+        highlights = data.get(username, {}).get(paper_key, [])
+    return jsonify({"ok": True, "highlights": highlights})
+
+
+@app.route("/api/highlights-all")
+def api_highlights_all():
+    """获取当前用户的所有标记，用于"我的标记"页面。"""
+    username = current_user()
+    if not username:
+        return jsonify({"ok": False, "msg": "需要登录"}), 401
+    with _highlights_lock:
+        data = _get_highlights()
+        user_data = data.get(username, {})
+    result: list[dict] = []
+    for paper_key, highlights in user_data.items():
+        parts = paper_key.split("/", 1)
+        d = parts[0] if len(parts) > 0 else ""
+        pid = parts[1] if len(parts) > 1 else ""
+        for h in highlights:
+            result.append({**h, "date": d, "paper_id": pid})
+    result.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    return jsonify({"ok": True, "highlights": result})
+
+
+@app.route("/my-highlights")
+def my_highlights_page():
+    username = current_user()
+    if not username:
+        return redirect(url_for("index"))
+    return render_template("my_highlights.html", username=username)
+
+
+# ─────────────────────────────────────────────
+# 收藏（可选文件夹分类）API
+# ─────────────────────────────────────────────
+
+def _favorite_key(date: str, paper_id: str) -> str:
+    return f"{date}/{paper_id}"
+
+
+@app.route("/api/favorite", methods=["POST"])
+def api_favorite_post():
+    """收藏一篇论文（可指定文件夹）。重复收藏视为更新文件夹。"""
+    username = require_user()
+    payload = request.get_json(silent=True) or {}
+    date = str(payload.get("date") or "").strip()
+    paper_id = str(payload.get("paper_id") or "").strip()
+    title = str(payload.get("title") or "").strip()
+    abs_url = str(payload.get("abs_url") or "").strip()
+    folder = str(payload.get("folder") or "").strip() or DEFAULT_FAVORITE_FOLDER
+    if not date or not paper_id:
+        return jsonify({"ok": False, "msg": "missing date or paper_id"}), 400
+    if len(folder) > 50:
+        return jsonify({"ok": False, "msg": "文件夹名过长"}), 400
+    key = _favorite_key(date, paper_id)
+    with _favorites_lock:
+        data = _get_favorites()
+        entry = _get_user_favorites(data, username)
+        if folder not in entry["folders"]:
+            entry["folders"].append(folder)
+        existing = entry["items"].get(key)
+        entry["items"][key] = {
+            "date": date,
+            "paper_id": paper_id,
+            "title": title or (existing or {}).get("title", ""),
+            "abs_url": abs_url or (existing or {}).get("abs_url", ""),
+            "folder": folder,
+            "created_at": (existing or {}).get("created_at") or datetime.now(BJ_TZ).isoformat(),
+        }
+        _favorites_store.put(username, entry)
+    return jsonify({"ok": True, "favorited": True, "folder": folder})
+
+
+@app.route("/api/favorite/<date>/<paper_id>", methods=["DELETE"])
+def api_favorite_delete(date: str, paper_id: str):
+    username = require_user()
+    key = _favorite_key(date, paper_id)
+    with _favorites_lock:
+        data = _get_favorites()
+        entry = data.get(username, {})
+        items = entry.get("items", {})
+        if key in items:
+            del items[key]
+            _favorites_store.put(username, entry)
+            return jsonify({"ok": True, "favorited": False})
+    return jsonify({"ok": False, "msg": "收藏不存在"}), 404
+
+
+@app.route("/api/favorites/<date>")
+def api_favorites_get(date: str):
+    """返回当前用户在该日期已收藏的论文及文件夹列表（供论文页渲染状态）。"""
+    username = current_user()
+    if not username:
+        return jsonify({"ok": True, "favorites": {}, "folders": [DEFAULT_FAVORITE_FOLDER]})
+    prefix = date + "/"
+    with _favorites_lock:
+        data = _get_favorites()
+        entry = data.get(username, {})
+        folders = list(entry.get("folders", [])) or [DEFAULT_FAVORITE_FOLDER]
+        if DEFAULT_FAVORITE_FOLDER not in folders:
+            folders.insert(0, DEFAULT_FAVORITE_FOLDER)
+        favorites = {}
+        for key, item in entry.get("items", {}).items():
+            if key.startswith(prefix):
+                favorites[key[len(prefix):]] = {"folder": item.get("folder", DEFAULT_FAVORITE_FOLDER)}
+    return jsonify({"ok": True, "favorites": favorites, "folders": folders})
+
+
+@app.route("/api/favorites-all")
+def api_favorites_all():
+    """当前用户的全部收藏，按文件夹分组，供"我的收藏"页面使用。"""
+    username = current_user()
+    if not username:
+        return jsonify({"ok": False, "msg": "需要登录"}), 401
+    with _favorites_lock:
+        data = _get_favorites()
+        entry = data.get(username, {})
+        folders = list(entry.get("folders", [])) or [DEFAULT_FAVORITE_FOLDER]
+        if DEFAULT_FAVORITE_FOLDER not in folders:
+            folders.insert(0, DEFAULT_FAVORITE_FOLDER)
+        items = list(entry.get("items", {}).values())
+    items.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    return jsonify({"ok": True, "folders": folders, "items": items})
+
+
+@app.route("/api/favorite-folder", methods=["POST"])
+def api_favorite_folder_create():
+    username = require_user()
+    payload = request.get_json(silent=True) or {}
+    name = str(payload.get("name") or "").strip()
+    if not name:
+        return jsonify({"ok": False, "msg": "文件夹名不能为空"}), 400
+    if len(name) > 50:
+        return jsonify({"ok": False, "msg": "文件夹名过长"}), 400
+    with _favorites_lock:
+        data = _get_favorites()
+        entry = _get_user_favorites(data, username)
+        if name in entry["folders"]:
+            return jsonify({"ok": False, "msg": "文件夹已存在"}), 409
+        entry["folders"].append(name)
+        _favorites_store.put(username, entry)
+    return jsonify({"ok": True, "name": name})
+
+
+@app.route("/api/favorite-folder/<path:name>", methods=["DELETE"])
+def api_favorite_folder_delete(name: str):
+    username = require_user()
+    name = (name or "").strip()
+    if name == DEFAULT_FAVORITE_FOLDER:
+        return jsonify({"ok": False, "msg": "默认收藏夹不可删除"}), 400
+    with _favorites_lock:
+        data = _get_favorites()
+        entry = _get_user_favorites(data, username)
+        if name not in entry["folders"]:
+            return jsonify({"ok": False, "msg": "文件夹不存在"}), 404
+        entry["folders"].remove(name)
+        # 该文件夹下的论文移回默认收藏夹
+        for item in entry["items"].values():
+            if item.get("folder") == name:
+                item["folder"] = DEFAULT_FAVORITE_FOLDER
+        _favorites_store.put(username, entry)
+    return jsonify({"ok": True})
+
+
+@app.route("/my-favorites")
+def my_favorites_page():
+    username = current_user()
+    if not username:
+        return redirect(url_for("index"))
+    return render_template("my_favorites.html", username=username)
+
+
+# ─────────────────────────────────────────────
+# ASLP 实验室新闻 / 公告 API
+# ─────────────────────────────────────────────
+
+@app.route("/api/lab-feed")
+def api_aslp_feed():
+    aslp_feed.ensure_started()
+    try:
+        limit = int(request.args.get("limit", 5))
+    except (TypeError, ValueError):
+        limit = 5
+    limit = max(1, min(limit, 20))
+    items = aslp_feed.get_items(limit=limit)
+    updated = aslp_feed.last_updated_iso() or "pending"
+    etag = f"lab-feed-{updated}-{limit}"
+    if request.headers.get("If-None-Match") == f'"{etag}"':
+        resp304 = Response(status=304)
+        resp304.set_etag(etag)
+        return _apply_no_cdn_cache(resp304)
+    resp = jsonify({
+        "ok": True,
+        "items": items,
+        "updated_at": updated if updated != "pending" else None,
+    })
+    resp.set_etag(etag)
+    return _apply_no_cdn_cache(resp)
 
 
 @app.route("/")
@@ -544,15 +1686,61 @@ def view_date(date: str):
         if i > 0:
             next_date = dates[i - 1]
 
+    papers_digest = content_digest.papers_list_digest(index) if index else None
+
     return render_template(
         "date.html",
         date=date,
         is_today=(date == today_str),
         index=index,
+        papers_digest=papers_digest,
         html_exists=html_exists,
         prev_date=prev_date,
         next_date=next_date,
     )
+
+
+@app.route("/paper/<date>/<paper_id>")
+def view_paper_share(date: str, paper_id: str):
+    """单篇论文分享页：仅展示一篇卡片，HTML 按内容 ETag 可供 CDN 缓存。"""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        abort(404)
+    if date not in list_all_dates():
+        abort(404)
+    index = load_index(date)
+    if not index:
+        abort(404)
+    target = _find_paper(index, paper_id)
+    if target is None:
+        abort(404)
+
+    paper_digest = content_digest.single_paper_digest(target)
+    etag = f"paper-{date}-{paper_id}-{paper_digest}"
+    if request.headers.get("If-None-Match") == etag:
+        r304 = Response(status=304)
+        r304.set_etag(etag)
+        r304.headers["Cache-Control"] = (
+            f"public, max-age=3600, s-maxage={IMMUTABLE_SMAXAGE_SECONDS}, "
+            "stale-while-revalidate=86400"
+        )
+        return r304
+
+    resp = make_response(
+        render_template(
+            "paper_share.html",
+            date=date,
+            paper_id=paper_id,
+            paper_title=target.get("title") or paper_id,
+            index=index,
+            paper_digest=paper_digest,
+        )
+    )
+    resp.set_etag(etag)
+    resp.headers["Cache-Control"] = (
+        f"public, max-age=3600, s-maxage={IMMUTABLE_SMAXAGE_SECONDS}, "
+        "stale-while-revalidate=86400"
+    )
+    return resp
 
 
 @app.route("/raw/<date>.html")
@@ -563,7 +1751,20 @@ def raw_html(date: str):
     path = discover_report_html(date)
     if not path:
         abort(404)
-    return send_from_directory(path.parent, path.name)
+    try:
+        mtime = int(path.stat().st_mtime)
+        etag = f'"report-{date}-{mtime}"'
+    except OSError:
+        etag = None
+    if etag and request.headers.get("If-None-Match") == etag:
+        r304 = Response(status=304)
+        r304.set_etag(etag.strip('"'))
+        return _apply_304_cache(r304)
+    resp = send_from_directory(path.parent, path.name)
+    if etag:
+        resp.set_etag(etag.strip('"'))
+        resp.headers["Cache-Control"] = _immutable_cache_control()
+    return resp
 
 
 @app.route("/download/<date>.html")
@@ -843,15 +2044,23 @@ def api_search():
 @app.route("/stats")
 def stats():
     """访问量看板：今日 24h 分布 + 最近 30 天历史。"""
+    return render_template("stats.html", **build_visit_stats())
+
+
+def build_visit_stats() -> dict:
     snapshot = get_visits_snapshot()
     today_str = datetime.now(BJ_TZ).strftime("%Y-%m-%d")
-    today_day = snapshot.get(today_str) or {"total": 0, "hourly": [0] * 24}
+    today_day = snapshot.get(today_str) or {"total": 0, "hourly": [0] * 24, "active_users": 0}
 
     sorted_dates = sorted(snapshot.keys(), reverse=True)
     recent: list[dict] = []
     for d in sorted_dates[:30]:
         day = snapshot[d]
-        recent.append({"date": d, "total": int(day.get("total", 0))})
+        recent.append({
+            "date": d,
+            "total": int(day.get("total", 0)),
+            "active_users": int(day.get("active_users", 0)),
+        })
     recent.reverse()  # 时间从左到右
 
     hourly = today_day.get("hourly", [0] * 24)
@@ -868,27 +2077,76 @@ def stats():
         r["is_today"] = (r["date"] == today_str)
 
     total = sum(int(d.get("total", 0)) for d in snapshot.values())
+    total_active_users = sum(int(d.get("active_users", 0)) for d in snapshot.values())
     day_count = len(snapshot)
     avg_per_day = round(total / day_count, 1) if day_count else 0
+    avg_active_users_per_day = round(total_active_users / day_count, 1) if day_count else 0
 
-    return render_template(
-        "stats.html",
-        today_total=int(today_day.get("total", 0)),
-        today_hourly=hourly,
-        hourly_pct=hourly_pct,
-        peak_hour_idx=peak_hour_idx,
-        peak_hour_count=max_hour,
-        recent=recent,
-        total=total,
-        day_count=day_count,
-        avg_per_day=avg_per_day,
-        today_str=today_str,
-    )
+    return {
+        "today_total": int(today_day.get("total", 0)),
+        "today_active_users": int(today_day.get("active_users", 0)),
+        "today_hourly": hourly,
+        "hourly_pct": hourly_pct,
+        "peak_hour_idx": peak_hour_idx,
+        "peak_hour_count": max_hour,
+        "recent": recent,
+        "total": total,
+        "total_active_users": total_active_users,
+        "day_count": day_count,
+        "avg_per_day": avg_per_day,
+        "avg_active_users_per_day": avg_active_users_per_day,
+        "today_str": today_str,
+    }
 
 
 @app.route("/api/visits")
 def api_visits():
     return {"visits": get_visits_snapshot()}
+
+
+@app.route("/api/tab-visit", methods=["POST"])
+def api_tab_visit():
+    payload = request.get_json(silent=True) or {}
+    tab_id = str(payload.get("tab_id") or "").strip()
+    if not _valid_tab_id(tab_id):
+        return {"ok": False, "msg": "invalid tab_id"}, 400
+
+    visitor_id = (request.cookies.get(VISITOR_COOKIE_NAME) or "").strip()
+    should_set_cookie = False
+    if not _valid_visitor_id(visitor_id):
+        visitor_id = _make_visitor_id()
+        should_set_cookie = True
+
+    try:
+        counted = record_tab_visit(visitor_id, tab_id)
+    except Exception as e:
+        log.warning(f"记录 tab 访问失败: {e}")
+        return {"ok": False, "msg": "failed to record visit"}, 500
+
+    response = {"ok": True, "counted": counted}
+    if should_set_cookie:
+        resp = app.response_class(
+            response=json.dumps(response, ensure_ascii=False),
+            status=200,
+            mimetype="application/json",
+        )
+        resp.set_cookie(
+            VISITOR_COOKIE_NAME,
+            visitor_id,
+            max_age=VISITOR_COOKIE_MAX_AGE,
+            httponly=True,
+            samesite="Lax",
+        )
+        return resp
+    return response
+
+
+@app.route("/admin/stats")
+def admin_stats():
+    auth_error = _admin_auth_error()
+    if auth_error:
+        return auth_error
+    return {"ok": True, "stats": build_visit_stats(), "visits": get_visits_snapshot()}
 
 
 # ─────────────────────────────────────────────
@@ -1155,12 +2413,20 @@ def main() -> None:
     )
     _scheduler.start()
 
+    static_assets.refresh()
+
+    ccf_catalog.start_background_refresh()
+
+    # 启动 ASLP 新闻/公告每小时刷新
+    aslp_feed.start_background_refresh()
+
     try:
         from waitress import serve
     except ImportError as e:
         raise SystemExit("缺少生产 WSGI server：请先安装 waitress（例如 uv sync 或 pip install waitress）") from e
 
     log.info(f"🌐 启动 Web 服务 http://{host}:{port} (waitress, threads={threads})")
+    log.info(f"🔐 认证: {auth.config_summary()}")
     serve(app, host=host, port=port, threads=threads)
 
 

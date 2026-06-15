@@ -1,0 +1,230 @@
+{% extends "base.html" %}
+{% block title %}我的收藏 · arXiv 每日精读{% endblock %}
+
+{% block content %}
+<section class="page-header">
+  <h1>我的收藏</h1>
+  <p class="subtitle">{{ username }} 收藏的论文，按文件夹分类</p>
+</section>
+
+<div class="fav-filter" id="fav-filter" style="display:none"></div>
+<div id="favorites-container">
+  <div class="loading-indicator">加载中...</div>
+</div>
+
+<script src="{{ static_asset('highlights.js') }}"></script>
+<script>
+  var PAGE_USER = {% if current_user %}'{{ current_user }}'{% else %}null{% endif %};
+</script>
+<script>
+(function () {
+  var container = document.getElementById('favorites-container');
+  var filterBar = document.getElementById('fav-filter');
+  var allItems = [];
+  var folders = [];
+  var activeFolder = '__all__';
+
+  var paperCache = {};
+
+  function escapeHtml(s) {
+    var d = document.createElement('div');
+    d.textContent = s || '';
+    return d.innerHTML;
+  }
+
+  function loadPapersForDate(date) {
+    if (paperCache[date]) return Promise.resolve(paperCache[date]);
+    return fetch('/api/papers-digest/' + date, { credentials: 'same-origin' })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (meta) {
+        if (!meta || !meta.ok || !meta.digest) return { papers: [] };
+        return fetch('/api/h/' + meta.digest + '/papers/' + date, { credentials: 'same-origin' })
+          .then(function (r) { return r.ok ? r.json() : { papers: [] }; });
+      })
+      .then(function (data) {
+        var map = {};
+        (data.papers || []).forEach(function (p) { map[p.paper_id] = p; });
+        paperCache[date] = map;
+        return map;
+      })
+      .catch(function () { paperCache[date] = {}; return {}; });
+  }
+
+  function renderDetail(detailsEl) {
+    var body = detailsEl.querySelector('.fav-detail-body');
+    if (!body || body.dataset.loaded) return;
+    var date = detailsEl.dataset.date, pid = detailsEl.dataset.pid;
+    loadPapersForDate(date).then(function (map) {
+      var p = map[pid];
+      body.dataset.loaded = '1';
+      if (!p) {
+        body.innerHTML = '<div class="empty-hint">未找到该论文的详细数据（可能索引已变动）。</div>';
+        return;
+      }
+      var html = '';
+      if (p.source_categories || p.is_cross_list) {
+        html += '<div class="paper-meta-line">';
+        (p.source_categories || []).forEach(function (c) { html += '<span class="cat-tag">' + escapeHtml(c) + '</span>'; });
+        if (p.is_cross_list) html += '<span class="badge badge-cross">跨领域</span>';
+        html += '</div>';
+      }
+      if (p.related_org_titles && p.related_org_titles.length) {
+        html += '<div class="org-tag-row">';
+        p.related_org_titles.forEach(function (o) { html += '<span class="org-tag">' + escapeHtml(o) + '</span>'; });
+        html += '</div>';
+      }
+      if (p.authors && p.authors.length) {
+        html += '<div class="paper-authors">' + escapeHtml(p.authors.join(', ')) + '</div>';
+      }
+      if (p.abstract) {
+        html += '<details class="abstract"><summary>查看摘要</summary><p>' + escapeHtml(p.abstract) + '</p></details>';
+      }
+      if (p.has_analysis) {
+        html += '<details class="analysis-section"><summary>📖 查看深度解读</summary>';
+        html += '<div class="analysis-content" data-date="' + escapeHtml(date) + '" data-pid="' + escapeHtml(pid) + '"></div>';
+        html += '</details>';
+      }
+      if (!html) html = '<div class="empty-hint">该论文暂无更多信息。</div>';
+      body.innerHTML = html;
+    });
+  }
+
+  // 展开内层「深度解读」时再按需拉取精读（懒加载 + 划线）
+  function loadFavAnalysis(contentDiv) {
+    if (contentDiv.dataset.rendered || contentDiv.dataset.loading) return;
+    var date = contentDiv.dataset.date, pid = contentDiv.dataset.pid;
+    contentDiv.dataset.loading = '1';
+    contentDiv.innerHTML = '<div class="loading-indicator">加载解读中...</div>';
+    var p = paperCache[date] && paperCache[date][pid];
+    var digest = p && p.analysis_digest;
+    var analysisUrl = digest
+      ? '/api/h/' + digest + '/analysis/' + date + '/' + encodeURIComponent(pid)
+      : '/api/analysis/' + date + '/' + encodeURIComponent(pid);
+    fetch(analysisUrl, { credentials: 'same-origin' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        var ok = d && d.ok && d.analysis_html;
+        contentDiv.innerHTML = ok ? d.analysis_html : '<div class="empty-hint">暂无解读。</div>';
+        contentDiv.dataset.rendered = '1';
+        contentDiv.removeAttribute('data-loading');
+        if (ok && typeof ArxivHL !== 'undefined') {
+          ArxivHL.attach(contentDiv, { date: date, paperId: pid, user: PAGE_USER });
+        }
+      })
+      .catch(function () {
+        contentDiv.innerHTML = '<div class="empty-hint">加载失败，请重试。</div>';
+        contentDiv.removeAttribute('data-loading');
+      });
+  }
+
+  document.addEventListener('toggle', function (e) {
+    if (!e.target.open || !e.target.classList) return;
+    if (e.target.classList.contains('fav-detail')) {
+      renderDetail(e.target);
+    } else if (e.target.classList.contains('analysis-section')) {
+      var cd = e.target.querySelector('.analysis-content');
+      if (cd && cd.dataset.date) loadFavAnalysis(cd);
+    }
+  }, true);
+
+  function load() {
+    fetch('/api/favorites-all', { credentials: 'same-origin' })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (!data.ok) {
+          container.innerHTML = '<div class="empty-hint">需要登录。</div>';
+          return;
+        }
+        allItems = data.items || [];
+        folders = data.folders || [];
+        renderFilter();
+        render();
+      });
+  }
+
+  function renderFilter() {
+    if (!allItems.length) { filterBar.style.display = 'none'; return; }
+    var counts = {};
+    allItems.forEach(function (it) {
+      var f = it.folder || '默认收藏';
+      counts[f] = (counts[f] || 0) + 1;
+    });
+    var html = '';
+    html += '<button class="fav-tab' + (activeFolder === '__all__' ? ' active' : '') + '" data-folder="__all__">全部 (' + allItems.length + ')</button>';
+    folders.forEach(function (f) {
+      var c = counts[f] || 0;
+      html += '<button class="fav-tab' + (activeFolder === f ? ' active' : '') + '" data-folder="' + escapeHtml(f) + '">' + escapeHtml(f) + ' (' + c + ')</button>';
+    });
+    filterBar.innerHTML = html;
+    filterBar.style.display = 'flex';
+    filterBar.querySelectorAll('.fav-tab').forEach(function (b) {
+      b.addEventListener('click', function () {
+        activeFolder = b.dataset.folder;
+        renderFilter();
+        render();
+      });
+    });
+  }
+
+  function render() {
+    var items = activeFolder === '__all__'
+      ? allItems
+      : allItems.filter(function (it) { return (it.folder || '默认收藏') === activeFolder; });
+
+    if (!items.length) {
+      container.innerHTML = '<div class="empty-hint">暂无收藏。阅读论文时点击「☆ 收藏」即可加入。</div>';
+      return;
+    }
+
+    // 按文件夹分组展示
+    var grouped = {};
+    items.forEach(function (it) {
+      var f = it.folder || '默认收藏';
+      if (!grouped[f]) grouped[f] = [];
+      grouped[f].push(it);
+    });
+
+    var html = '';
+    Object.keys(grouped).forEach(function (f) {
+      html += '<div class="highlights-date-group">';
+      html += '<h2 class="highlights-date-title">📁 ' + escapeHtml(f) + '</h2>';
+      grouped[f].forEach(function (it) {
+        var titleHtml = it.abs_url
+          ? '<a href="' + escapeHtml(it.abs_url) + '" target="_blank">' + escapeHtml(it.title || it.paper_id) + '</a>'
+          : escapeHtml(it.title || it.paper_id);
+        html += '<div class="highlight-item fav-item" data-key="' + escapeHtml(it.date + '/' + it.paper_id) + '">';
+        html += '<div class="highlight-item-text" style="font-weight:600">' + titleHtml + '</div>';
+        html += '<div class="highlight-item-meta">';
+        html += '<a href="/date/' + escapeHtml(it.date) + '">' + escapeHtml(it.date) + '</a> · ' + escapeHtml(it.paper_id);
+        html += '</div>';
+        html += '<details class="fav-detail" data-date="' + escapeHtml(it.date) + '" data-pid="' + escapeHtml(it.paper_id) + '">';
+        html += '<summary>展开详情（作者 / 摘要 / 深度解读）</summary>';
+        html += '<div class="fav-detail-body"><div class="loading-indicator">加载中...</div></div>';
+        html += '</details>';
+        html += '<div class="highlight-item-actions">';
+        html += '<span class="highlight-item-time">收藏于 ' + (it.created_at ? it.created_at.substring(0, 16) : '') + '</span>';
+        html += '<button class="nav-btn outline small" onclick="removeFavorite(\'' + encodeURIComponent(it.date) + '\',\'' + encodeURIComponent(it.paper_id) + '\')">取消收藏</button>';
+        html += '</div></div>';
+      });
+      html += '</div>';
+    });
+    container.innerHTML = html;
+  }
+
+  window.removeFavorite = function (date, pid) {
+    fetch('/api/favorite/' + date + '/' + pid, { method: 'DELETE', credentials: 'same-origin' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (d.ok) {
+          var dd = decodeURIComponent(date), pp = decodeURIComponent(pid);
+          allItems = allItems.filter(function (it) { return !(it.date === dd && it.paper_id === pp); });
+          renderFilter();
+          render();
+        }
+      });
+  };
+
+  load();
+})();
+</script>
+{% endblock %}

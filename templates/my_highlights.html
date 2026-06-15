@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}我的标记 · arXiv 每日精读{% endblock %}
+
+{% block content %}
+<section class="page-header">
+  <h1>我的标记</h1>
+  <p class="subtitle">{{ username }} 的所有阅读标记</p>
+</section>
+<div id="highlights-container">
+  <div class="loading-indicator">加载中...</div>
+</div>
+<script>
+(function(){
+  var container = document.getElementById('highlights-container');
+  fetch('/api/highlights-all', {credentials:'same-origin'})
+    .then(function(r){return r.json()})
+    .then(function(data){
+      if(!data.ok || !data.highlights.length){
+        container.innerHTML = '<div class="empty-hint">暂无标记，阅读论文时选中文字即可标记。</div>';
+        return;
+      }
+      var grouped = {};
+      data.highlights.forEach(function(h){
+        var key = h.date;
+        if(!grouped[key]) grouped[key] = [];
+        grouped[key].push(h);
+      });
+      var html = '';
+      var dates = Object.keys(grouped).sort().reverse();
+      dates.forEach(function(d){
+        html += '<div class="highlights-date-group">';
+        html += '<h2 class="highlights-date-title"><a href="/date/'+d+'">'+d+'</a></h2>';
+        grouped[d].forEach(function(h){
+          html += '<div class="highlight-item" data-id="'+h.id+'">';
+          html += '<div class="highlight-item-meta">论文: <a href="/date/'+h.date+'">'+h.paper_id+'</a></div>';
+          html += '<div class="highlight-item-text" style="border-left:3px solid '+h.color+';padding-left:10px">'+escapeHtml(h.text)+'</div>';
+          if(h.comment){
+            html += '<div class="highlight-item-note">💬 '+escapeHtml(h.comment)+'</div>';
+          }
+          html += '<div class="highlight-item-actions">';
+          html += '<span class="highlight-item-time">'+h.created_at.substring(0,16)+'</span>';
+          html += '<button class="nav-btn outline small" onclick="deleteHighlight(\''+h.id+'\')">删除</button>';
+          html += '</div></div>';
+        });
+        html += '</div>';
+      });
+      container.innerHTML = html;
+    });
+
+  function escapeHtml(s){
+    var d=document.createElement('div');d.textContent=s;return d.innerHTML;
+  }
+  window.deleteHighlight = function(id){
+    fetch('/api/highlight/'+id,{method:'DELETE',credentials:'same-origin'})
+      .then(function(r){return r.json()})
+      .then(function(d){
+        if(d.ok){
+          var el=document.querySelector('.highlight-item[data-id="'+id+'"]');
+          if(el)el.remove();
+        }
+      });
+  };
+})();
+</script>
+{% endblock %}
