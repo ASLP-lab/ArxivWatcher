@@ -3,7 +3,20 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="light dark">
 <title>{% block title %}arXiv 每日论文精读{% endblock %}</title>
+<script>
+/* 防闪烁：在 CSS 渲染前根据 localStorage 决定主题，避免深色刷新闪白。
+   localStorage['theme'] = 'light' | 'dark' | 未设(跟随系统) */
+(function () {
+  try {
+    var t = localStorage.getItem('theme');
+    if (t === 'light' || t === 'dark') {
+      document.documentElement.setAttribute('data-theme', t);
+    }
+  } catch (e) {}
+})();
+</script>
 <link rel="stylesheet" href="{{ static_asset('style.css') }}">
 {% block head_extra %}{% endblock %}
 </head>
@@ -20,9 +33,17 @@
       <a href="{{ url_for('search') }}" class="{% if request.endpoint == 'search' %}active{% endif %}">搜索</a>
       <a href="{{ url_for('rss_page') }}" class="{% if request.endpoint in ['rss_page', 'rss_feed'] %}active{% endif %}">RSS</a>
       <a href="{{ url_for('zotero_plugin_page') }}" class="{% if request.endpoint == 'zotero_plugin_page' %}active{% endif %}">Zotero</a>
+      <a href="{{ url_for('mcp_page') }}" class="{% if request.endpoint == 'mcp_page' %}active{% endif %}">MCP</a>
       <a href="{{ url_for('stats') }}" class="{% if request.endpoint == 'stats' %}active{% endif %}">统计</a>
     </nav>
+    <button class="theme-toggle" id="theme-toggle" type="button" title="切换深色 / 浅色 / 跟随系统" aria-label="切换主题">
+      <span class="theme-icon-moon">🌙</span><span class="theme-icon-sun">☀️</span>
+    </button>
     <div class="auth-area">
+      <a class="auth-link" href="{{ url_for('my_reading_list_page') }}" title="阅读列表（点赞自动加入）">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M1 2.828c.885-.37 2.154-.769 3.388-.893 1.33-.134 2.678.208 3.701.788.72.4 1.438.855 2.062 1.292.624-.437 1.342-.892 2.062-1.292 1.023-.58 2.371-.922 3.701-.788 1.234.124 2.503.523 3.388.893L9 6.731V13.5a1.5 1.5 0 0 1-1.5 1.5h-5A1.5 1.5 0 0 1 1 13.5V6.731z"/></svg>
+        <span>阅读</span>
+      </a>
       {% if current_user %}
       <a class="auth-link" href="{{ url_for('my_favorites_page') }}" title="我的收藏">
         <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M3.612 15.443c-.386.198-.824-.149-.746-.592l.83-4.73L.173 6.765c-.329-.314-.158-.888.283-.95l4.898-.696L7.538.792c.197-.39.73-.39.927 0l2.184 4.327 4.898.696c.441.062.612.636.282.95l-3.522 3.356.83 4.73c.078.443-.36.79-.746.592L8 13.187l-4.389 2.256z"/></svg>
@@ -62,6 +83,8 @@
 <main class="site-main">
   {% block content %}{% endblock %}
 </main>
+
+{% block content_extra %}{% endblock %}
 
 <footer class="site-footer">
   <div class="site-footer-inner">
@@ -151,6 +174,45 @@ function handleRegister(e){
   return false;
 }
 document.getElementById('auth-modal').addEventListener('click',function(e){if(e.target===this)hideAuthModal()});
+</script>
+
+<script>
+/* 主题切换：system → light → dark → system 循环。
+   localStorage['theme'] = 'light' | 'dark' | 未设(=跟随系统) */
+(function () {
+  var btn = document.getElementById('theme-toggle');
+  if (!btn) return;
+  function currentLabel() {
+    var t = null;
+    try { t = localStorage.getItem('theme'); } catch (e) {}
+    if (t === 'light') return 'light';
+    if (t === 'dark') return 'dark';
+    return 'system';
+  }
+  function applyLabel() {
+    var l = currentLabel();
+    btn.title = '当前: ' + (l === 'system' ? '跟随系统' : (l === 'dark' ? '深色' : '浅色'))
+      + '（点击切换：浅色 → 深色 → 跟随系统）';
+  }
+  btn.addEventListener('click', function () {
+    var cur = currentLabel();
+    var next;
+    if (cur === 'system') next = 'light';
+    else if (cur === 'light') next = 'dark';
+    else next = null; /* dark → 回到跟随系统 */
+    try {
+      if (next) localStorage.setItem('theme', next);
+      else localStorage.removeItem('theme');
+    } catch (e) {}
+    if (next === 'light' || next === 'dark') {
+      document.documentElement.setAttribute('data-theme', next);
+    } else {
+      document.documentElement.removeAttribute('data-theme');
+    }
+    applyLabel();
+  });
+  applyLabel();
+})();
 </script>
 
 <script>

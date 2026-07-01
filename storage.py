@@ -8,6 +8,7 @@
     comments     : "日期/paper_id" -> [comment, ...]
     highlights   : username        -> {paper_key: [highlight, ...]}
     favorites    : username        -> {folders: [...], items: {...}}
+    reading_list : identity        -> {items: {date/paper_id: {...}}}
     users        : username        -> {password_hash, created_at}
     visits       : 日期            -> {total, hourly, users, tabs, ...}
 
@@ -34,6 +35,7 @@ STORE_FILES: dict[str, str] = {
     "comments": "comments.json",
     "highlights": "highlights.json",
     "favorites": "favorites.json",
+    "reading_list": "reading_list.json",
     "users": "users.json",
     "visits": "visits.json",
     "arxiv_versions": "arxiv_versions.json",

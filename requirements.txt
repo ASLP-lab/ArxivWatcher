@@ -1,7 +1,10 @@
 beautifulsoup4>=4.14.0
 requests>=2.30.0
 pypdf>=6.0.0
+pymupdf>=1.24.0
+Pillow>=10.0.0
 markdown>=3.0.0
 flask>=3.0.0
+gunicorn>=23.0.0
 waitress>=3.0.2
 bcrypt>=4.0.0

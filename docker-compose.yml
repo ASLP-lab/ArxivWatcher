@@ -22,7 +22,9 @@ services:
       # ── Web ──
       WEB_HOST: 0.0.0.0
       WEB_PORT: 8091
-      WEB_THREADS: 8
+      WEB_WORKERS: 48
+      WEB_SERVER: gunicorn
+      WEB_SCHEDULER: external
       TZ: Asia/Shanghai
 
       # ── 定时任务（工作日 北京时间 10:00 触发 run.sh）──
@@ -50,7 +52,7 @@ services:
       WEB_PUBLIC_URL: http://127.0.0.1:8091
 
       # ── LDAP（如启用 ldap 认证方式，取消注释并填好）──
-      # LDAP_URI: ldap://192.168.0.16
+      # LDAP_URI: ldap://ldap.example.com
       # LDAP_START_TLS: "false"
       # LDAP_BASE_DN: dc=ldapdomain,dc=com
       # LDAP_USER_FILTER: "(uid={username})"

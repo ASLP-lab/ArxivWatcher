@@ -12,6 +12,8 @@ export TZ="${TZ:-Asia/Shanghai}"
 
 export WEB_HOST="${WEB_HOST:-127.0.0.1}"
 export WEB_PORT="${WEB_PORT:-8091}"
+export WEB_WORKERS="${WEB_WORKERS:-48}"
+export WEB_SERVER="${WEB_SERVER:-gunicorn}"
 export WEB_PUBLIC_URL="${WEB_PUBLIC_URL:-http://${WEB_HOST}:${WEB_PORT}}"
 
 # 飞书 webhook（可选，会传给定时任务里的 run.sh）
@@ -26,4 +28,4 @@ echo "Web:  http://${WEB_HOST}:${WEB_PORT}"
 echo "定时: 工作日 北京时间 ${DAILY_HOUR}:$(printf '%02d' "${DAILY_MINUTE}") → ${RUN_SCRIPT}"
 echo "检测: ${ARXIV_CHECK_CATEGORIES}"
 
-exec python web.py
+exec bash run_web.sh

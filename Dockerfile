@@ -43,8 +43,8 @@ LABEL org.opencontainers.image.title="ArxivWatcher" \
       org.opencontainers.image.url="https://hub.docker.com/r/aslplab/arxivwatcher" \
       org.opencontainers.image.documentation="https://github.com/ASLP-lab/ArxivWatcher#readme" \
       org.opencontainers.image.vendor="ASLP-lab" \
-      org.opencontainers.image.authors="ASLP-lab <g3349495429@163.com>" \
-      org.opencontainers.image.maintainer="ASLP-lab <g3349495429@163.com>" \
+      org.opencontainers.image.authors="ASLP-lab" \
+      org.opencontainers.image.maintainer="ASLP-lab" \
       org.opencontainers.image.licenses="CC-BY-4.0"
 
 # 运行期系统依赖：tzdata 时区数据；tini 作 PID 1 正确转发信号；curl 健康检查
@@ -68,7 +68,8 @@ ENV PATH="/opt/venv/bin:${PATH}" \
 # 运行时默认环境变量（用户可覆盖）
 ENV WEB_HOST=0.0.0.0 \
     WEB_PORT=8091 \
-    WEB_THREADS=8 \
+    WEB_WORKERS=48 \
+    WEB_SERVER=gunicorn \
     # Docker 部署默认 SQLite（高并发更稳，避免每次写全量 JSON）
     STORAGE_BACKEND=sqlite \
     SQLITE_PATH=/app/data/app.db
@@ -80,6 +81,8 @@ WORKDIR /app
 
 # 拷贝源代码（.dockerignore 会过滤掉 .venv/.git/data 等）
 COPY --chown=app:app . /app
+
+RUN chmod +x /app/run_web.sh
 
 # 运行期可写目录：data / reports / logs / arxiv_digest_work
 RUN mkdir -p /app/data /app/reports /app/logs /app/arxiv_digest_work \
@@ -93,8 +96,8 @@ EXPOSE 8091
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:${WEB_PORT}/" || exit 1
 
-# tini 负责正确转发 SIGTERM（waitress 会优雅退出）
+# tini 负责正确转发 SIGTERM（gunicorn 会优雅退出）
 ENTRYPOINT ["/usr/bin/tini", "--"]
 
 # 默认启动 Web 服务；想跑单次抓取可覆盖为：python send.py --category eess.AS cs.SD --no-email
-CMD ["python", "web.py"]
+CMD ["./run_web.sh"]

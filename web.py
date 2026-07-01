@@ -10,7 +10,10 @@
 环境变量:
   WEB_HOST      默认 127.0.0.1
   WEB_PORT      默认 8080
-  WEB_THREADS   Waitress 工作线程数，默认 8
+  WEB_SERVER    WSGI 服务：gunicorn（默认）或 waitress（开发单进程）
+  WEB_SCHEDULER external（默认）调度器独立进程；in_process 则嵌入某个 gunicorn worker
+  WEB_WORKERS   Gunicorn worker 进程数，默认 48
+  WEB_THREADS   Waitress 工作线程数（仅 WEB_SERVER=waitress），默认 8
   RUN_SCRIPT    每日执行的脚本，默认 ./run.sh
   DAILY_HOUR    每日运行小时（24h，北京时间），默认 10
   DAILY_MINUTE  每日运行分钟，默认 0
@@ -29,6 +32,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import io
 import gzip
@@ -83,6 +87,10 @@ import content_digest
 import static_assets
 import auth
 import storage
+import mcp_server
+import paper_assets
+import highlight_authors
+import llm_usage
 
 ROOT = Path(__file__).resolve().parent
 
@@ -117,7 +125,13 @@ def _make_store(name: str) -> "storage.Store":
 
 
 DATA_DIR = ROOT / "data" / "papers"
+BACKGROUND_LOCK_FILE = DATA_ROOT / ".web_background.lock"
+SCHEDULER_STATUS_FILE = DATA_ROOT / "scheduler_status.json"
+SCHEDULER_TRIGGER_FILE = DATA_ROOT / "scheduler_trigger.json"
+CLASSIFY_STATE_FILE = DATA_ROOT / "classify_state.json"
+CLASSIFY_LOCK_FILE = DATA_ROOT / ".classify.lock"
 REPORTS_DIR = ROOT / "reports"
+LOGS_DIR = ROOT / "logs"
 TEMPLATES_DIR = ROOT / "templates"
 STATIC_DIR = ROOT / "static"
 
@@ -609,6 +623,9 @@ _highlights_lock = threading.Lock()
 _favorites_store = _make_store("favorites")
 _favorites_lock = threading.Lock()
 
+_reading_list_store = _make_store("reading_list")
+_reading_list_lock = threading.Lock()
+
 _arxiv_versions_store = _make_store("arxiv_versions")
 _arxiv_version_cache = arxiv_version.ArxivVersionCache(_arxiv_versions_store)
 
@@ -627,6 +644,149 @@ def _get_highlights() -> dict:
 
 def _get_favorites() -> dict:
     return _favorites_store.all()
+
+
+def _get_reading_list() -> dict:
+    return _reading_list_store.all()
+
+
+def _get_user_reading_list(data: dict, identity: str) -> dict:
+    """获取（并按需初始化）某访客的阅读列表。"""
+    entry = data.setdefault(identity, {})
+    entry.setdefault("items", {})
+    return entry
+
+
+def _reading_list_item_key(date: str, paper_id: str) -> str:
+    return f"{date}/{paper_id}"
+
+
+def _paper_title_from_index(date: str, paper_id: str) -> str:
+    index = load_index(date)
+    if not index:
+        return paper_id
+    target = _find_paper(index, paper_id)
+    if not target:
+        return paper_id
+    return str(target.get("title") or paper_id)
+
+
+def _add_to_reading_list(identity: str, date: str, paper_id: str, *, title: str = "") -> bool:
+    """点赞时加入阅读列表；已存在则不覆盖 read 状态。返回是否新加入。"""
+    if not identity or not date or not paper_id:
+        return False
+    key = _reading_list_item_key(date, paper_id)
+    with _reading_list_lock:
+        data = _get_reading_list()
+        entry = _get_user_reading_list(data, identity)
+        if key in entry["items"]:
+            return False
+        entry["items"][key] = {
+            "date": date,
+            "paper_id": paper_id,
+            "title": title or _paper_title_from_index(date, paper_id),
+            "added_at": datetime.now(BJ_TZ).isoformat(),
+            "read": False,
+            "read_at": None,
+        }
+        _reading_list_store.put(identity, entry)
+    return True
+
+
+def _remove_from_reading_list(identity: str, date: str, paper_id: str) -> bool:
+    """取消点赞时从阅读列表移除。返回是否曾存在并已删除。"""
+    if not identity or not date or not paper_id:
+        return False
+    key = _reading_list_item_key(date, paper_id)
+    with _reading_list_lock:
+        data = _get_reading_list()
+        entry = data.get(identity)
+        if not entry or key not in (entry.get("items") or {}):
+            return False
+        del entry["items"][key]
+        _reading_list_store.put(identity, entry)
+    return True
+
+
+def _set_reading_list_item_read(
+    identity: str, date: str, paper_id: str, *, read: bool,
+) -> Optional[dict]:
+    if not identity:
+        return None
+    key = _reading_list_item_key(date, paper_id)
+    with _reading_list_lock:
+        data = _get_reading_list()
+        entry = _get_user_reading_list(data, identity)
+        item = entry["items"].get(key)
+        if not item:
+            return None
+        item["read"] = bool(read)
+        item["read_at"] = datetime.now(BJ_TZ).isoformat() if read else None
+        _reading_list_store.put(identity, entry)
+        return dict(item)
+
+
+def _list_reading_items_for_identity(identity: str, date: Optional[str] = None) -> list[dict]:
+    if not identity:
+        return []
+    with _reading_list_lock:
+        data = _get_reading_list()
+        entry = data.get(identity) or {}
+        items = list((entry.get("items") or {}).values())
+    if date:
+        items = [i for i in items if str(i.get("date") or "") == date]
+    items.sort(key=lambda x: (x.get("date") or "", x.get("added_at") or ""), reverse=True)
+    return items
+
+
+def _liked_keys_for_identity(identity: str, date: Optional[str] = None) -> set[str]:
+    """该访客当前仍保持点赞的 date/paper_id 键集合。"""
+    liked: set[str] = set()
+    prefix = f"{date}/" if date else ""
+    with _interactions_lock:
+        data = _get_interactions()
+        for key, entry in data.items():
+            if date and not key.startswith(prefix):
+                continue
+            if identity in (entry.get("liked_by") or {}):
+                liked.add(key)
+    return liked
+
+
+def _sync_reading_list_with_likes(identity: str, date: Optional[str] = None) -> None:
+    """阅读列表与点赞状态对齐：补全历史点赞、移除已取消点赞。"""
+    if not identity:
+        return
+    liked_keys = _liked_keys_for_identity(identity, date)
+    with _reading_list_lock:
+        data = _get_reading_list()
+        entry = _get_user_reading_list(data, identity)
+        items = entry["items"]
+        changed = False
+        for key in liked_keys:
+            if key in items:
+                continue
+            date_part, paper_id = key.split("/", 1)
+            items[key] = {
+                "date": date_part,
+                "paper_id": paper_id,
+                "title": _paper_title_from_index(date_part, paper_id),
+                "added_at": datetime.now(BJ_TZ).isoformat(),
+                "read": False,
+                "read_at": None,
+            }
+            changed = True
+        stale: list[str] = []
+        for key in list(items.keys()):
+            if date and not key.startswith(f"{date}/"):
+                continue
+            if key not in liked_keys:
+                stale.append(key)
+        for key in stale:
+            del items[key]
+            changed = True
+        if changed:
+            _reading_list_store.put(identity, entry)
 
 
 def _get_user_favorites(data: dict, username: str) -> dict:
@@ -713,6 +873,8 @@ def search_papers(
 STATIC_CACHE_SECONDS = int(os.environ.get("STATIC_CACHE_SECONDS", str(365 * 24 * 3600)))
 static_assets.init(STATIC_DIR)
 static_assets.refresh()
+# 注册 MCP (Model Context Protocol) 端点 /mcp，供 Cursor / Claude Code / Codex 等接入
+mcp_server.register(app)
 IMMUTABLE_CACHE_SECONDS = int(os.environ.get("IMMUTABLE_CACHE_SECONDS", str(24 * 3600)))
 IMMUTABLE_SMAXAGE_SECONDS = int(os.environ.get("IMMUTABLE_SMAXAGE_SECONDS", str(7 * 24 * 3600)))
 
@@ -745,6 +907,63 @@ def _apply_hashed_content_cache(resp: Response) -> Response:
         f"public, max-age={STATIC_CACHE_SECONDS}, "
         f"s-maxage={STATIC_CACHE_SECONDS}, immutable"
     )
+    return resp
+
+
+def _paper_asset_manifest_cache_control() -> str:
+    """论文图表 manifest / 表格 JSON：公开可读，CDN 边缘可缓存。"""
+    return (
+        f"public, max-age={IMMUTABLE_CACHE_SECONDS}, "
+        f"s-maxage={IMMUTABLE_SMAXAGE_SECONDS}, "
+        "stale-while-revalidate=86400"
+    )
+
+
+def _paper_asset_file_cache_control(*, versioned: bool) -> str:
+    """论文图表 webp：带 /v/<digest>/ 的 URL 可 immutable 长期缓存。"""
+    if versioned:
+        return (
+            f"public, max-age={STATIC_CACHE_SECONDS}, "
+            f"s-maxage={STATIC_CACHE_SECONDS}, immutable"
+        )
+    return (
+        f"public, max-age={IMMUTABLE_CACHE_SECONDS}, "
+        f"s-maxage={IMMUTABLE_SMAXAGE_SECONDS}"
+    )
+
+
+def _file_etag(path: Path) -> str:
+    stat = path.stat()
+    return f'"{stat.st_mtime_ns}-{stat.st_size}"'
+
+
+def _send_versioned_file(path: Path, mimetype: str, *, versioned: bool) -> Response:
+    """发送磁盘文件并设置 CDN 友好的 Cache-Control / ETag。"""
+    if not path.is_file():
+        abort(404)
+    etag = _file_etag(path)
+    if request.headers.get("If-None-Match") == etag:
+        resp = Response(status=304)
+        resp.headers["ETag"] = etag
+        resp.headers["Cache-Control"] = _paper_asset_file_cache_control(versioned=versioned)
+        return resp
+    resp = send_from_directory(path.parent, path.name, mimetype=mimetype)
+    resp.headers["ETag"] = etag
+    resp.headers["Cache-Control"] = _paper_asset_file_cache_control(versioned=versioned)
+    return resp
+
+
+def _json_with_paper_asset_cache(payload: dict, cache_digest: str) -> Response:
+    """manifest / 表格 JSON：ETag + CDN s-maxage。"""
+    etag = f'"{cache_digest}"'
+    if request.headers.get("If-None-Match") == etag:
+        resp = Response(status=304)
+        resp.headers["ETag"] = etag
+        resp.headers["Cache-Control"] = _paper_asset_manifest_cache_control()
+        return resp
+    resp = jsonify(payload)
+    resp.headers["ETag"] = etag
+    resp.headers["Cache-Control"] = _paper_asset_manifest_cache_control()
     return resp
 
 
@@ -880,6 +1099,7 @@ def _set_cache_headers(response: Response) -> Response:
         "/api/comment",
         "/api/favorites",
         "/api/favorite",
+        "/api/reading-list",
         "/api/highlights",
         "/api/highlights-community",
         "/api/highlight",
@@ -895,6 +1115,13 @@ def _set_cache_headers(response: Response) -> Response:
     # 实验室动态：每小时刷新，禁止 CDN 共享缓存（避免边缘节点长期返回旧条目）
     if path == "/api/lab-feed":
         return _apply_no_cdn_cache(response)
+
+    # 论文图表（无显式 Cache-Control 时的兜底；正常由各路由自行设置）
+    if path.startswith("/api/paper-assets/"):
+        if "/v/" in path:
+            return _apply_hashed_content_cache(response)
+        response.headers["Cache-Control"] = _paper_asset_manifest_cache_control()
+        return response
 
     # RSS：中等缓存
     if path == "/rss/feed.xml":
@@ -973,6 +1200,9 @@ def _find_paper(index: dict, paper_id: str) -> Optional[dict]:
     for p in index.get("papers", []):
         if str(p.get("paper_id")) == str(paper_id):
             return p
+    for p in index.get("extra_papers") or []:
+        if str(p.get("paper_id")) == str(paper_id):
+            return p
     return None
 
 
@@ -1013,6 +1243,33 @@ def api_ccf_catalog_hashed(digest: str):
         "ok": True,
         "digest": digest,
         "entries": entries,
+    }))
+
+
+@app.route("/api/highlight-authors")
+def api_highlight_authors_meta():
+    """返回重点作者名单内容哈希与可长期缓存的 URL。"""
+    names = highlight_authors.get_names()
+    digest = highlight_authors.get_digest()
+    if not digest:
+        return jsonify({"ok": True, "digest": "", "url": "", "names": []})
+    return _apply_no_cdn_cache(jsonify({
+        "ok": True,
+        "digest": digest,
+        "url": url_for("api_highlight_authors_hashed", digest=digest),
+    }))
+
+
+@app.route("/api/h/<digest>/highlight-authors")
+def api_highlight_authors_hashed(digest: str):
+    """内容寻址：重点作者名单（供前端匹配论文作者）。"""
+    expected = highlight_authors.get_digest()
+    if not expected or digest != expected:
+        abort(404)
+    return _apply_hashed_content_cache(jsonify({
+        "ok": True,
+        "digest": digest,
+        "names": highlight_authors.get_names(),
     }))
 
 
@@ -1110,6 +1367,278 @@ def api_analysis(date: str, paper_id: str):
     return _apply_no_cdn_cache(jsonify({"ok": True, "analysis_html": html}))
 
 
+# 论文全文文本缓存目录（按日期组织），供「问 AI」功能实时提取 PDF 文本
+def _paper_text_cache_dir(date_str: str) -> Path:
+    d = DATA_DIR / "_fulltext" / date_str
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def extract_paper_fulltext(
+    date: str,
+    target: dict,
+    *,
+    txt_path: "Path | None" = None,
+) -> "str | None":
+    """提取并返回单篇论文的 PDF 全文文本（带磁盘缓存）。
+
+    返回:
+      - 非空字符串: 成功
+      - "": PDF 文本为空（扫描件等）
+      - None: 下载或解析失败（已记录日志）
+    复用 send 模块的 download_pdf / extract_text_from_pdf。
+    """
+    paper_id = str(target.get("paper_id", ""))
+    if txt_path is None:
+        cache_dir = _paper_text_cache_dir(date)
+        safe_id = re.sub(r"[^\w\-.]", "_", paper_id)
+        txt_path = cache_dir / f"{safe_id}.txt"
+
+    # 1) 读磁盘缓存
+    if txt_path.exists():
+        try:
+            text = txt_path.read_text(encoding="utf-8")
+            if text.strip():
+                return text
+        except OSError:
+            pass
+
+    # 2) 实时下载 + 提取（延迟导入 send，复用其 PDF 处理逻辑）
+    try:
+        import send as send_mod
+    except Exception as e:  # pragma: no cover
+        log.error(f"paper-text: 导入 send 失败: {e}")
+        return None
+
+    pdf_dir = send_mod.PROJECT_ROOT / "arxiv_digest_work" / "pdfs"
+    pdf_dir.mkdir(parents=True, exist_ok=True)
+
+    paper = send_mod.Paper(
+        paper_id=paper_id,
+        title=target.get("title", ""),
+        authors=target.get("authors", []) or [],
+        comments=target.get("comments", ""),
+        subjects=target.get("subjects", ""),
+        abstract=target.get("abstract", ""),
+        pdf_url=target.get("pdf_url") or f"https://arxiv.org/pdf/{paper_id}",
+        abs_url=target.get("abs_url") or f"https://arxiv.org/abs/{paper_id}",
+        source_categories=target.get("source_categories", []) or [],
+    )
+
+    try:
+        pdf_path = send_mod.download_pdf(paper, pdf_dir)
+    except Exception as e:
+        log.warning(f"paper-text: PDF 下载失败 {paper_id}: {e}")
+        return None
+    if not pdf_path:
+        log.warning(f"paper-text: PDF 下载失败 {paper_id}")
+        return None
+
+    try:
+        text = send_mod.extract_text_from_pdf(pdf_path)
+    except Exception as e:
+        log.warning(f"paper-text: 文本提取失败 {paper_id}: {e}")
+        return None
+
+    if text.strip():
+        # 写缓存（失败不影响返回）
+        try:
+            txt_path.write_text(text, encoding="utf-8")
+        except OSError as e:
+            log.warning(f"paper-text: 缓存写入失败 {txt_path}: {e}")
+    return text
+
+
+@app.route("/api/paper-text/<date>/<paper_id>")
+def api_paper_text(date: str, paper_id: str):
+    """提取并返回单篇论文的 PDF 全文文本（供前端「问 AI」作为上下文）。
+
+    公开接口（与 analysis 一致）。首次请求会下载 PDF 并提取文本，
+    结果缓存到 data/papers/_fulltext/<date>/<paper_id>.txt，后续直接读缓存。
+    """
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        abort(404)
+    # 校验 paper_id 格式（arXiv ID，防止路径穿越）
+    if not re.fullmatch(r"[A-Za-z0-9._/\-]+", paper_id) or ".." in paper_id:
+        return jsonify({"ok": False, "msg": "invalid paper_id"}), 400
+    index = load_index(date)
+    if not index:
+        abort(404)
+    target = _find_paper(index, paper_id)
+    if target is None:
+        return jsonify({"ok": False, "msg": "paper not found"}), 404
+
+    cache_dir = _paper_text_cache_dir(date)
+    safe_id = re.sub(r"[^\w\-.]", "_", paper_id)
+    txt_path = cache_dir / f"{safe_id}.txt"
+    cached = txt_path.exists()
+
+    text = extract_paper_fulltext(date, target, txt_path=txt_path)
+    if text is None:
+        return jsonify({"ok": False, "msg": "PDF 全文提取失败（下载或解析失败，详见服务端日志）"}), 502
+    if not text:
+        return jsonify({"ok": False, "msg": "PDF 文本提取为空（可能是扫描件或图片型 PDF）"}), 422
+    return jsonify({"ok": True, "text": text, "cached": cached and text.strip() != ""})
+
+
+def _validate_paper_api(date: str, paper_id: str) -> tuple[Optional[dict], Optional[tuple]]:
+    """校验 date / paper_id 并返回 index 中的论文 dict；失败时返回 (None, (response, status))。"""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        abort(404)
+    if not re.fullmatch(r"[A-Za-z0-9._/\-]+", paper_id) or ".." in paper_id:
+        return None, (jsonify({"ok": False, "msg": "invalid paper_id"}), 400)
+    index = load_index(date)
+    if not index:
+        abort(404)
+    target = _find_paper(index, paper_id)
+    if target is None:
+        return None, (jsonify({"ok": False, "msg": "paper not found"}), 404)
+    return target, None
+
+
+@app.route("/api/paper-assets/<date>/<paper_id>")
+@app.route("/api/paper-assets/<date>/<paper_id>/v/<cache_v>")
+def api_paper_assets_list(date: str, paper_id: str, cache_v: str | None = None):
+    """返回论文 PDF 内图表/表格清单，并懒生成缩略图（首次请求扫描 PDF）。"""
+    target, err_resp = _validate_paper_api(date, paper_id)
+    if err_resp:
+        return err_resp
+    cache_dir = paper_assets.assets_cache_dir(DATA_DIR, date, paper_id)
+    had_manifest = paper_assets.manifest_path(cache_dir).is_file()
+    manifest, err = paper_assets.ensure_manifest(DATA_DIR, date, target)
+    if err or manifest is None:
+        return jsonify({"ok": False, "msg": err or "提取失败"}), 502
+
+    digest = paper_assets.manifest_cache_digest(manifest)
+    if cache_v and cache_v != digest:
+        abort(404)
+
+    assets_out = []
+    for a in manifest.get("assets") or []:
+        aid = int(a["id"])
+        item = {
+            "id": aid,
+            "type": a.get("type", "figure"),
+            "page": a.get("page"),
+            "label": a.get("label", ""),
+            "caption": a.get("caption") or "",
+            "width_px": a.get("width_px"),
+            "height_px": a.get("height_px"),
+            "thumb_url": url_for(
+                "api_paper_asset_thumb",
+                date=date,
+                paper_id=paper_id,
+                cache_v=digest,
+                asset_id=aid,
+            ),
+            "full_url": url_for(
+                "api_paper_asset_full",
+                date=date,
+                paper_id=paper_id,
+                cache_v=digest,
+                asset_id=aid,
+            ),
+        }
+        if a.get("type") == "table" and a.get("source") == "arxiv_html":
+            item["table_url"] = url_for(
+                "api_paper_asset_table",
+                date=date,
+                paper_id=paper_id,
+                cache_v=digest,
+                asset_id=aid,
+            )
+        assets_out.append(item)
+
+    payload = {
+        "ok": True,
+        "cached": had_manifest,
+        "cache_v": digest,
+        "source": manifest.get("source"),
+        "html_url": manifest.get("html_url"),
+        "assets": assets_out,
+    }
+    return _json_with_paper_asset_cache(payload, digest)
+
+
+@app.route("/api/paper-assets/<date>/<paper_id>/v/<cache_v>/<int:asset_id>/thumb")
+@app.route("/api/paper-assets/<date>/<paper_id>/<int:asset_id>/thumb")
+def api_paper_asset_thumb(
+    date: str,
+    paper_id: str,
+    asset_id: int,
+    cache_v: str | None = None,
+):
+    target, err_resp = _validate_paper_api(date, paper_id)
+    if err_resp:
+        return err_resp
+    manifest, err = paper_assets.ensure_manifest(DATA_DIR, date, target)
+    if err or manifest is None:
+        return jsonify({"ok": False, "msg": err or "提取失败"}), 502
+    digest = paper_assets.manifest_cache_digest(manifest)
+    if cache_v and cache_v != digest:
+        abort(404)
+    if paper_assets.get_asset_entry(manifest, asset_id) is None:
+        abort(404)
+    cache_dir = paper_assets.assets_cache_dir(DATA_DIR, date, paper_id)
+    path = paper_assets.thumb_file(cache_dir, asset_id)
+    return _send_versioned_file(path, "image/webp", versioned=bool(cache_v))
+
+
+@app.route("/api/paper-assets/<date>/<paper_id>/v/<cache_v>/<int:asset_id>/full")
+@app.route("/api/paper-assets/<date>/<paper_id>/<int:asset_id>/full")
+def api_paper_asset_full(
+    date: str,
+    paper_id: str,
+    asset_id: int,
+    cache_v: str | None = None,
+):
+    target, err_resp = _validate_paper_api(date, paper_id)
+    if err_resp:
+        return err_resp
+    manifest, err = paper_assets.ensure_manifest(DATA_DIR, date, target)
+    if err or manifest is None:
+        return jsonify({"ok": False, "msg": err or "提取失败"}), 502
+    digest = paper_assets.manifest_cache_digest(manifest)
+    if cache_v and cache_v != digest:
+        abort(404)
+    asset = paper_assets.get_asset_entry(manifest, asset_id)
+    if asset is None:
+        abort(404)
+    if asset.get("type") == "table":
+        if asset.get("source") == "arxiv_html":
+            return jsonify({"ok": False, "msg": "HTML 表格请使用 table 接口"}), 400
+        path, err = paper_assets.ensure_full_table_image(DATA_DIR, date, target, asset_id)
+    else:
+        path, err = paper_assets.ensure_full_image(DATA_DIR, date, target, asset_id)
+    if err or path is None or not path.is_file():
+        return jsonify({"ok": False, "msg": err or "生成失败"}), 502
+    return _send_versioned_file(path, "image/webp", versioned=bool(cache_v))
+
+
+@app.route("/api/paper-assets/<date>/<paper_id>/v/<cache_v>/<int:asset_id>/table")
+@app.route("/api/paper-assets/<date>/<paper_id>/<int:asset_id>/table")
+def api_paper_asset_table(
+    date: str,
+    paper_id: str,
+    asset_id: int,
+    cache_v: str | None = None,
+):
+    """返回 arXiv HTML 表格内容与表注（JSON）。"""
+    target, err_resp = _validate_paper_api(date, paper_id)
+    if err_resp:
+        return err_resp
+    manifest, err = paper_assets.ensure_manifest(DATA_DIR, date, target)
+    if err or manifest is None:
+        return jsonify({"ok": False, "msg": err or "提取失败"}), 502
+    digest = paper_assets.manifest_cache_digest(manifest)
+    if cache_v and cache_v != digest:
+        abort(404)
+    data, err = paper_assets.get_table_content(DATA_DIR, date, target, asset_id)
+    if err or data is None:
+        return jsonify({"ok": False, "msg": err or "表格不可用"}), 404
+    return _json_with_paper_asset_cache({"ok": True, **data}, digest)
+
+
 # ─────────────────────────────────────────────
 # 赞/踩 API
 # ─────────────────────────────────────────────
@@ -1142,9 +1671,18 @@ def api_like():
             entry["likes"] = entry.get("likes", 0) + 1
             user_liked = True
         _interactions_store.put(key, entry)
+    reading_added = False
+    reading_removed = False
+    if user_liked:
+        title = _paper_title_from_index(date, paper_id)
+        reading_added = _add_to_reading_list(voter, date, paper_id, title=title)
+    else:
+        reading_removed = _remove_from_reading_list(voter, date, paper_id)
     return jsonify({
         "ok": True, "likes": entry["likes"], "dislikes": entry["dislikes"],
         "user_liked": user_liked, "user_disliked": False,
+        "reading_added": reading_added,
+        "reading_removed": reading_removed,
     })
 
 
@@ -1159,11 +1697,13 @@ def api_dislike():
     if not voter:
         return jsonify({"ok": False, "msg": "需要 cookie 或登录才能投票"}), 401
     key = _interaction_key(date, paper_id)
+    had_liked = False
     with _interactions_lock:
         data = _get_interactions()
         entry = data.setdefault(key, {"likes": 0, "dislikes": 0, "liked_by": {}, "disliked_by": {}})
         # 取消之前的赞
         if voter in entry.get("liked_by", {}):
+            had_liked = True
             del entry["liked_by"][voter]
             entry["likes"] = max(0, entry.get("likes", 0) - 1)
         # 切换踩
@@ -1176,9 +1716,11 @@ def api_dislike():
             entry["dislikes"] = entry.get("dislikes", 0) + 1
             user_disliked = True
         _interactions_store.put(key, entry)
+    reading_removed = _remove_from_reading_list(voter, date, paper_id) if had_liked else False
     return jsonify({
         "ok": True, "likes": entry["likes"], "dislikes": entry["dislikes"],
         "user_liked": False, "user_disliked": user_disliked,
+        "reading_removed": reading_removed,
     })
 
 
@@ -1575,6 +2117,59 @@ def api_favorites_all():
     return jsonify({"ok": True, "folders": folders, "items": items})
 
 
+@app.route("/api/reading-list/<date>")
+def api_reading_list_date(date: str):
+    """某日阅读列表（点赞自动加入）。"""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        abort(404)
+    identity = _get_voter_identity()
+    if not identity:
+        return jsonify({"ok": False, "msg": "需要 cookie 或登录才能使用阅读列表"}), 401
+    _sync_reading_list_with_likes(identity, date)
+    items = _list_reading_items_for_identity(identity, date)
+    unread = sum(1 for i in items if not i.get("read"))
+    return jsonify({"ok": True, "date": date, "items": items, "unread": unread})
+
+
+@app.route("/api/reading-list-all")
+def api_reading_list_all():
+    """全部阅读列表（按日期分组）。"""
+    identity = _get_voter_identity()
+    if not identity:
+        return jsonify({"ok": False, "msg": "需要 cookie 或登录才能使用阅读列表"}), 401
+    _sync_reading_list_with_likes(identity)
+    items = _list_reading_items_for_identity(identity)
+    unread = sum(1 for i in items if not i.get("read"))
+    by_date: dict[str, list] = {}
+    for item in items:
+        d = str(item.get("date") or "")
+        by_date.setdefault(d, []).append(item)
+    return jsonify({
+        "ok": True,
+        "items": items,
+        "by_date": by_date,
+        "unread": unread,
+    })
+
+
+@app.route("/api/reading-list/read", methods=["POST"])
+def api_reading_list_set_read():
+    """标记阅读列表项为已读 / 未读。"""
+    identity = _get_voter_identity()
+    if not identity:
+        return jsonify({"ok": False, "msg": "需要 cookie 或登录才能使用阅读列表"}), 401
+    payload = request.get_json(silent=True) or {}
+    date = str(payload.get("date") or "").strip()
+    paper_id = str(payload.get("paper_id") or "").strip()
+    if not date or not paper_id:
+        return jsonify({"ok": False, "msg": "missing date or paper_id"}), 400
+    read = bool(payload.get("read"))
+    item = _set_reading_list_item_read(identity, date, paper_id, read=read)
+    if item is None:
+        return jsonify({"ok": False, "msg": "not in reading list"}), 404
+    return jsonify({"ok": True, "item": item})
+
+
 @app.route("/api/favorite-folder", methods=["POST"])
 def api_favorite_folder_create():
     username = require_user()
@@ -1612,6 +2207,11 @@ def api_favorite_folder_delete(name: str):
                 item["folder"] = DEFAULT_FAVORITE_FOLDER
         _favorites_store.put(username, entry)
     return jsonify({"ok": True})
+
+
+@app.route("/my-reading-list")
+def my_reading_list_page():
+    return render_template("my_reading_list.html")
 
 
 @app.route("/my-favorites")
@@ -1910,6 +2510,17 @@ def zotero_plugin_page():
     )
 
 
+@app.route("/mcp-guide")
+def mcp_page():
+    """MCP 接入说明页：教用户如何把本站论文数据接入 Cursor / Claude Code / Codex。
+
+    注意：说明页用 /mcp-guide；/mcp 路径专留给 MCP 协议端点（POST JSON-RPC，
+    GET 按 Streamable HTTP 规范返回 405）。两者不能共用同一路径。
+    """
+    base = request.host_url.rstrip("/")
+    return render_template("mcp.html", mcp_endpoint=f"{base}/mcp")
+
+
 @app.route("/zotero-plugin/download.xpi")
 def zotero_plugin_xpi():
     """动态打包并下载插件 xpi。"""
@@ -2043,8 +2654,10 @@ def api_search():
 
 @app.route("/stats")
 def stats():
-    """访问量看板：今日 24h 分布 + 最近 30 天历史。"""
-    return render_template("stats.html", **build_visit_stats())
+    """访问量看板：今日 24h 分布 + 最近 30 天历史；含 LLM Token 消耗。"""
+    ctx = build_visit_stats()
+    ctx.update(llm_usage.build_stats())
+    return render_template("stats.html", **ctx)
 
 
 def build_visit_stats() -> dict:
@@ -2153,6 +2766,224 @@ def admin_stats():
 # 后台定时调度
 # ─────────────────────────────────────────────
 
+_scheduler: Optional["DailyScheduler"] = None
+_background_lock_fd: Optional[int] = None
+_classify_lock_fd: Optional[int] = None
+
+
+def _compute_next_fire_at(hour: int, minute: int, now: datetime) -> datetime:
+    fire = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if fire <= now:
+        fire += timedelta(days=1)
+    while fire.weekday() >= 5:
+        fire += timedelta(days=1)
+    return fire
+
+
+def _persist_scheduler_status(scheduler: "DailyScheduler", *, scrape_pid: Optional[int] = None) -> None:
+    try:
+        now = datetime.now(BJ_TZ)
+        next_fire = _compute_next_fire_at(scheduler.hour, scheduler.minute, now)
+        payload = {
+            "fire_hour": scheduler.hour,
+            "fire_minute": scheduler.minute,
+            "last_run": scheduler.last_run.isoformat() if scheduler.last_run else None,
+            "last_status": scheduler.last_status,
+            "freshness_wait": scheduler.freshness_wait,
+            "main_running": scheduler._running_lock.locked(),
+            "next_run": next_fire.isoformat(),
+            "updated_at": now.isoformat(),
+        }
+        if scrape_pid is not None:
+            payload["scrape_pid"] = scrape_pid
+        DATA_ROOT.mkdir(parents=True, exist_ok=True)
+        SCHEDULER_STATUS_FILE.write_text(
+            json.dumps(payload, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        log.debug("persist scheduler status: %s", e)
+
+
+def _load_scheduler_status() -> dict:
+    if not SCHEDULER_STATUS_FILE.is_file():
+        return {}
+    try:
+        data = json.loads(SCHEDULER_STATUS_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _scheduler_runtime_view() -> dict:
+    """合并本 worker 内存状态与磁盘快照，供多 worker 下状态 API 使用。"""
+    if _scheduler:
+        now = datetime.now(BJ_TZ)
+        return {
+            "fire_hour": _scheduler.hour,
+            "fire_minute": _scheduler.minute,
+            "last_run": _scheduler.last_run.isoformat() if _scheduler.last_run else None,
+            "last_status": _scheduler.last_status,
+            "freshness_wait": _scheduler.freshness_wait,
+            "main_running": _scheduler._running_lock.locked(),
+            "next_run": _compute_next_fire_at(_scheduler.hour, _scheduler.minute, now).isoformat(),
+        }
+    return _load_scheduler_status()
+
+
+def _enqueue_scheduler_run(reason: str = "manual") -> None:
+    payload = {
+        "reason": reason,
+        "requested_at": datetime.now(BJ_TZ).isoformat(),
+    }
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    SCHEDULER_TRIGGER_FILE.write_text(
+        json.dumps(payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def _start_scheduler_trigger_watcher() -> None:
+    def watch() -> None:
+        while True:
+            if _scheduler and SCHEDULER_TRIGGER_FILE.is_file():
+                try:
+                    raw = SCHEDULER_TRIGGER_FILE.read_text(encoding="utf-8")
+                    SCHEDULER_TRIGGER_FILE.unlink(missing_ok=True)
+                    data = json.loads(raw) if raw.strip() else {}
+                    reason = str(data.get("reason") or "manual")
+                    threading.Thread(
+                        target=_scheduler.run_once,
+                        kwargs={"reason": reason},
+                        daemon=True,
+                    ).start()
+                except Exception as e:
+                    log.warning("处理 scheduler 触发请求失败: %s", e)
+            time.sleep(2)
+
+    threading.Thread(target=watch, daemon=True, name="scheduler-trigger").start()
+
+
+def _save_classify_state() -> None:
+    try:
+        DATA_ROOT.mkdir(parents=True, exist_ok=True)
+        CLASSIFY_STATE_FILE.write_text(
+            json.dumps(_classify_state, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        log.debug("persist classify state: %s", e)
+
+
+def _get_classify_state_snapshot() -> dict:
+    if CLASSIFY_STATE_FILE.is_file():
+        try:
+            data = json.loads(CLASSIFY_STATE_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    return dict(_classify_state)
+
+
+def _try_acquire_classify_lock() -> bool:
+    global _classify_lock_fd
+    try:
+        DATA_ROOT.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(CLASSIFY_LOCK_FILE), os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _classify_lock_fd = fd
+        return True
+    except BlockingIOError:
+        return False
+
+
+def _release_classify_lock() -> None:
+    global _classify_lock_fd
+    if _classify_lock_fd is None:
+        return
+    try:
+        fcntl.flock(_classify_lock_fd, fcntl.LOCK_UN)
+        os.close(_classify_lock_fd)
+    except OSError:
+        pass
+    _classify_lock_fd = None
+
+
+def init_background_services() -> None:
+    """启动调度器与后台刷新任务；多 worker 下仅一个进程持有文件锁。"""
+    global _scheduler, _background_lock_fd
+
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    static_assets.refresh()
+
+    try:
+        DATA_ROOT.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(BACKGROUND_LOCK_FILE), os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            log.info("后台任务已由其他 worker 负责，本 worker 仅处理 HTTP")
+            return
+
+        _background_lock_fd = fd
+        hour = int(os.environ.get("DAILY_HOUR", "10"))
+        minute = int(os.environ.get("DAILY_MINUTE", "0"))
+        run_script = Path(os.environ.get("RUN_SCRIPT", str(ROOT / "run.sh"))).resolve()
+        categories = os.environ.get("ARXIV_CHECK_CATEGORIES", "eess.AS cs.SD").split()
+        feishu_webhook_url = os.environ.get("FEISHU_WEBHOOK_URL", "")
+
+        _scheduler = DailyScheduler(
+            hour=hour,
+            minute=minute,
+            run_script=run_script,
+            categories=categories,
+            feishu_webhook_url=feishu_webhook_url,
+        )
+        _scheduler.start()
+        _persist_scheduler_status(_scheduler)
+        _start_scheduler_trigger_watcher()
+
+        ccf_catalog.start_background_refresh()
+        aslp_feed.start_background_refresh()
+        log.info("本 worker 已获取后台任务锁，调度器与刷新任务已启动")
+    except Exception:
+        log.exception("init background services failed")
+
+
+def init_web_worker() -> None:
+    """Gunicorn worker 启动时调用：默认只刷新静态资源，调度器由独立进程负责。"""
+    mode = os.environ.get("WEB_SCHEDULER", "external").strip().lower()
+    if mode == "in_process":
+        init_background_services()
+    else:
+        static_assets.refresh()
+
+
+def run_scheduler_daemon() -> None:
+    """独立进程：定时调度 + 后台刷新（与 gunicorn worker 分离，避免抓取时拖垮 Web）。"""
+    import signal
+
+    def _shutdown(signum, _frame) -> None:  # noqa: ARG001
+        log.info("收到信号 %s，调度器进程退出", signum)
+        if _scheduler:
+            _scheduler.stop()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
+    init_background_services()
+    if not _scheduler:
+        raise SystemExit("调度器未能启动（可能已有其它 scheduler 进程在运行）")
+    log.info("调度器独立进程已启动（WEB_SCHEDULER=external），gunicorn worker 不再承担抓取任务")
+    while True:
+        time.sleep(3600)
+
+
 class DailyScheduler(threading.Thread):
     """工作日固定时刻（北京时间）调用 run.sh 抓取论文。"""
 
@@ -2176,6 +3007,7 @@ class DailyScheduler(threading.Thread):
         self.retry_seconds = retry_seconds
         self._stop_event = threading.Event()
         self._running_lock = threading.Lock()
+        self.freshness_wait: Optional[dict] = None
         self.last_run: Optional[datetime] = None
         self.last_status: str = "未运行"
 
@@ -2184,12 +3016,7 @@ class DailyScheduler(threading.Thread):
         return dt.weekday() < 5  # 0=周一 … 4=周五
 
     def _next_fire_at(self, now: datetime) -> datetime:
-        fire = now.replace(hour=self.hour, minute=self.minute, second=0, microsecond=0)
-        if fire <= now:
-            fire += timedelta(days=1)
-        while not self._is_weekday(fire):
-            fire += timedelta(days=1)
-        return fire
+        return _compute_next_fire_at(self.hour, self.minute, now)
 
     @staticmethod
     def _parse_arxiv_listing_date(html: str) -> Optional[datetime]:
@@ -2245,9 +3072,11 @@ class DailyScheduler(threading.Thread):
     def _wait_until_fresh_or_retry_exhausted(self, reason: str) -> bool:
         if reason != "scheduled":
             return True
+        self.freshness_wait = None
         for attempt in range(1, self.max_attempts + 1):
             ready, stale_categories = self._check_categories_are_today()
             if ready:
+                self.freshness_wait = None
                 log.info(f"全部分类已更新到今日，尝试 {attempt}/{self.max_attempts}，开始抓取")
                 return True
             stale_str = ", ".join(stale_categories)
@@ -2259,15 +3088,30 @@ class DailyScheduler(threading.Thread):
             )
             log.info(msg.replace("\n", " | "))
             self._send_feishu_text(msg)
+            self.last_status = (
+                f"等待 arXiv 更新 ({attempt}/{self.max_attempts})，"
+                f"{wait_min} 分钟后重试"
+            )
+            _persist_scheduler_status(self)
             if attempt >= self.max_attempts:
                 break
             remaining = self.retry_seconds
             while remaining > 0 and not self._stop_event.is_set():
-                step = min(remaining, 60)
+                self.freshness_wait = {
+                    "attempt": attempt,
+                    "max_attempts": self.max_attempts,
+                    "remaining_seconds": remaining,
+                    "retry_seconds": self.retry_seconds,
+                    "stale_categories": list(stale_categories),
+                }
+                _persist_scheduler_status(self)
+                step = min(remaining, 10)
                 time.sleep(step)
                 remaining -= step
             if self._stop_event.is_set():
+                self.freshness_wait = None
                 return False
+        self.freshness_wait = None
         fail_msg = (
             f"⚠️ arXiv 今日列表检测已达最大重试次数（{self.max_attempts} 次），"
             "今日任务暂不执行。"
@@ -2275,10 +3119,14 @@ class DailyScheduler(threading.Thread):
         log.warning(fail_msg)
         self._send_feishu_text(fail_msg)
         self.last_status = f"等待更新超时（{self.max_attempts} 次）"
+        _persist_scheduler_status(self)
         return False
 
     def run_once(self, reason: str = "scheduled") -> int:
-        """实际执行 run.sh。"""
+        """实际执行 run.sh（freshness 等待期间不占「运行中」锁）。"""
+        if not self._wait_until_fresh_or_retry_exhausted(reason):
+            return -3
+
         if not self._running_lock.acquire(blocking=False):
             log.warning("上一次任务还在运行，跳过本次")
             return -1
@@ -2287,24 +3135,41 @@ class DailyScheduler(threading.Thread):
             self.last_run = start
             log.info(f"🚀 触发每日任务 ({reason}) at {start.isoformat()}")
             self.last_status = f"运行中 since {start.strftime('%H:%M:%S')}"
-
-            if not self._wait_until_fresh_or_retry_exhausted(reason):
-                return -3
+            self.freshness_wait = None
+            _persist_scheduler_status(self)
 
             if not self.run_script.exists():
                 log.error(f"未找到 {self.run_script}")
                 self.last_status = f"失败：未找到 {self.run_script}"
+                _persist_scheduler_status(self)
                 return -2
 
             env = os.environ.copy()
             env.setdefault("SEND_EMAIL_ROOT", str(ROOT))
 
-            proc = subprocess.run(
-                ["bash", str(self.run_script)],
-                cwd=str(ROOT),
-                env=env,
-            )
-            log.info(f"🏁 每日任务完成 exit={proc.returncode}")
+            LOGS_DIR.mkdir(parents=True, exist_ok=True)
+            log_path = LOGS_DIR / f"daily_run_{start.strftime('%Y%m%d_%H%M%S')}.log"
+            log.info(f"抓取日志: {log_path}")
+
+            def _lower_cpu_priority() -> None:
+                try:
+                    os.nice(10)
+                except OSError:
+                    pass
+
+            with open(log_path, "a", encoding="utf-8") as log_file:
+                proc = subprocess.Popen(
+                    ["bash", str(self.run_script)],
+                    cwd=str(ROOT),
+                    env=env,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    preexec_fn=_lower_cpu_priority,
+                )
+                _persist_scheduler_status(self, scrape_pid=proc.pid)
+                returncode = proc.wait()
+            log.info(f"🏁 每日任务完成 exit={returncode}")
 
             # 清缓存，让 web 立即看到新数据
             with _index_lock:
@@ -2313,12 +3178,14 @@ class DailyScheduler(threading.Thread):
 
             end = datetime.now(BJ_TZ)
             self.last_status = (
-                f"{'成功' if proc.returncode == 0 else f'退出码 {proc.returncode}'} "
+                f"{'成功' if returncode == 0 else f'退出码 {returncode}'} "
                 f"@ {end.strftime('%Y-%m-%d %H:%M:%S')}"
             )
-            return proc.returncode
+            _persist_scheduler_status(self)
+            return returncode
         finally:
             self._running_lock.release()
+            _persist_scheduler_status(self)
 
     def run(self) -> None:
         log.info(
@@ -2348,6 +3215,7 @@ class DailyScheduler(threading.Thread):
             except Exception as e:
                 log.exception(f"任务执行异常: {e}")
                 self.last_status = f"异常: {e}"
+                _persist_scheduler_status(self)
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -2360,11 +3228,415 @@ def admin_run_now():
     if auth_error:
         return auth_error
     if not _scheduler:
-        return {"ok": False, "msg": "scheduler not started"}, 500
+        _enqueue_scheduler_run("manual")
+        return {"ok": True, "msg": "已提交触发请求（由调度 worker 执行）"}
     threading.Thread(
         target=_scheduler.run_once, kwargs={"reason": "manual"}, daemon=True
     ).start()
     return {"ok": True, "msg": "已触发，可在日志中查看进度"}
+
+
+_classify_state: dict = {
+    "running": False,
+    "last_run": None,
+    "last_status": None,
+    "last_stats": None,
+    "task_type": None,
+    "progress": {
+        "current": 0,
+        "total": 0,
+        "percent": 0,
+        "bar": "",
+        "paper_id": "",
+        "title": "",
+    },
+}
+
+
+def _reset_classify_progress() -> None:
+    _classify_state["progress"] = {
+        "current": 0,
+        "total": 0,
+        "percent": 0,
+        "bar": "",
+        "paper_id": "",
+        "title": "",
+    }
+    _save_classify_state()
+
+
+def _update_classify_progress(current: int, total: int, paper) -> None:
+    import send as send_mod
+
+    bar = send_mod.format_progress_bar(current, total)
+    pct = int(100 * current / total) if total else 0
+    _classify_state["progress"] = {
+        "current": current,
+        "total": total,
+        "percent": pct,
+        "bar": bar,
+        "paper_id": getattr(paper, "paper_id", ""),
+        "title": (getattr(paper, "title", "") or "")[:80],
+    }
+    _classify_state["last_status"] = f"筛选中 {bar} {getattr(paper, 'paper_id', '')}"
+    _save_classify_state()
+    log.info(
+        f"筛选进度 {bar} {getattr(paper, 'paper_id', '')} "
+        f"{(getattr(paper, 'title', '') or '')[:50]}"
+    )
+
+
+def _parse_shell_exports(path: Path, *, prefix: str = "") -> dict[str, str]:
+    """从 shell 脚本解析 export KEY=VALUE（不执行脚本，仅读字面量）。"""
+    out: dict[str, str] = {}
+    if not path.is_file():
+        return out
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return out
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        if prefix and not key.startswith(prefix):
+            continue
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        out[key] = val
+    return out
+
+
+def _llm_env() -> dict[str, str]:
+    """合并进程环境变量与 llm_config.sh（进程 env 优先）。"""
+    env = dict(os.environ)
+    for name in ("llm_config.sh", "llm_config.local.sh"):
+        for key, val in _parse_shell_exports(ROOT / name, prefix="LLM_").items():
+            if not str(env.get(key, "")).strip():
+                env[key] = val
+    return env
+
+
+def _build_llm_config_from_env():
+    import send as send_mod
+
+    env = _llm_env()
+    api_key = str(env.get("LLM_API_KEY", "")).strip()
+    if not api_key:
+        cfg = ROOT / "llm_config.sh"
+        hint = (
+            f"未找到 LLM_API_KEY。请在环境变量中设置，或创建 {cfg.name} "
+            f"（可参考 llm_config.example.sh），然后重启 web 服务。"
+        )
+        raise ValueError(hint)
+    enable_thinking = str(env.get("LLM_ENABLE_THINKING", "")).strip().lower() in ("1", "true", "yes", "on")
+    concurrency = send_mod.env_int("LLM_CONCURRENCY", send_mod.DEFAULT_LLM_CONCURRENCY)
+    return send_mod.LLMConfig(
+        base_url=env.get("LLM_BASE_URL", send_mod.DEFAULT_LLM_BASE_URL),
+        api_key=api_key,
+        model=env.get("LLM_MODEL", send_mod.DEFAULT_LLM_MODEL),
+        max_tokens=int(env.get("LLM_MAX_TOKENS", str(send_mod.DEFAULT_MAX_TOKENS))),
+        enable_thinking=enable_thinking,
+        concurrency=concurrency,
+    )
+
+
+def _run_classify_second(date_str: str, paper_id: Optional[str] = None) -> None:
+    global _classify_state
+    import send as send_mod
+
+    try:
+        llm_config = _build_llm_config_from_env()
+        stats = send_mod.run_classify_from_json(
+            date_str,
+            llm_config,
+            paper_id=paper_id,
+            progress_callback=_update_classify_progress,
+        )
+        with _index_lock:
+            _index_cache.clear()
+            _index_mtime.clear()
+        _classify_state["last_stats"] = stats
+        total = stats.get("to_classify") or stats.get("total") or 0
+        bar = send_mod.format_progress_bar(total, total) if total else ""
+        _classify_state["progress"] = {
+            "current": total,
+            "total": total,
+            "percent": 100 if total else 0,
+            "bar": bar,
+            "paper_id": "",
+            "title": "",
+        }
+        _classify_state["last_status"] = (
+            f"完成 {bar} processed={stats.get('processed', 0)} "
+            f"skipped={stats.get('skipped', 0)} failed={stats.get('failed', 0)}"
+        )
+    except Exception as e:
+        log.exception(f"第二次 LLM 筛选失败: {e}")
+        _classify_state["last_status"] = f"失败: {e}"
+    finally:
+        _classify_state["running"] = False
+        _classify_state["task_type"] = None
+        _save_classify_state()
+        _release_classify_lock()
+
+
+@app.route("/admin/run-second", methods=["POST"])
+def admin_run_second():
+    """手动触发第二次 LLM 筛选（领域/创新/评分/黑名单），基于已有 JSON 解读结果。"""
+    auth_error = _admin_auth_error()
+    if auth_error:
+        return auth_error
+
+    payload = request.get_json(silent=True) or {}
+    date_str = str(payload.get("date") or "").strip()
+    if not date_str:
+        date_str = datetime.now(BJ_TZ).strftime("%Y-%m-%d")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_str):
+        return jsonify({"ok": False, "msg": "invalid date, use YYYY-MM-DD"}), 400
+
+    paper_id = str(payload.get("paper_id") or "").strip() or None
+    json_path = DATA_DIR / f"{date_str}.json"
+    if not json_path.is_file():
+        return jsonify({"ok": False, "msg": f"no data for {date_str}"}), 404
+
+    if _get_classify_state_snapshot().get("running"):
+        return jsonify({"ok": False, "msg": "classify task already running"}), 409
+    if not _try_acquire_classify_lock():
+        return jsonify({"ok": False, "msg": "classify task already running"}), 409
+
+    _classify_state["running"] = True
+    _classify_state["last_run"] = datetime.now(BJ_TZ).isoformat()
+    _classify_state["last_status"] = f"运行中 date={date_str}"
+    _classify_state["task_type"] = "run-second"
+    _reset_classify_progress()
+    _save_classify_state()
+    threading.Thread(
+        target=_run_classify_second,
+        kwargs={"date_str": date_str, "paper_id": paper_id},
+        daemon=True,
+    ).start()
+    return jsonify({
+        "ok": True,
+        "msg": "已触发第二次 LLM 筛选，可在日志中查看进度",
+        "date": date_str,
+        "paper_id": paper_id,
+    })
+
+
+@app.route("/admin/run-second/status")
+def admin_run_second_status():
+    """查询第二次 LLM 筛选任务状态。"""
+    auth_error = _admin_auth_error()
+    if auth_error:
+        return auth_error
+    out = _get_classify_state_snapshot()
+    out["ok"] = True
+    return jsonify(out)
+
+
+@app.route("/admin/retry-failed", methods=["POST"])
+def admin_retry_failed():
+    """重试失败论文：解读失败→重跑解读；筛选失败→重跑筛选。"""
+    auth_error = _admin_auth_error()
+    if auth_error:
+        return auth_error
+
+    payload = request.get_json(silent=True) or {}
+    date_str = str(payload.get("date") or "").strip()
+    if not date_str:
+        date_str = datetime.now(BJ_TZ).strftime("%Y-%m-%d")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_str):
+        return jsonify({"ok": False, "msg": "invalid date, use YYYY-MM-DD"}), 400
+
+    paper_id = str(payload.get("paper_id") or "").strip() or None
+    json_path = DATA_DIR / f"{date_str}.json"
+    if not json_path.is_file():
+        return jsonify({"ok": False, "msg": f"no data for {date_str}"}), 404
+
+    if _get_classify_state_snapshot().get("running"):
+        return jsonify({
+            "ok": False,
+            "msg": "another classify/retry task already running",
+        }), 409
+    if not _try_acquire_classify_lock():
+        return jsonify({
+            "ok": False,
+            "msg": "another classify/retry task already running",
+        }), 409
+
+    _classify_state["running"] = True
+    _classify_state["last_run"] = datetime.now(BJ_TZ).isoformat()
+    _classify_state["last_status"] = f"重试中 date={date_str}"
+    _classify_state["task_type"] = "retry-failed"
+    _reset_classify_progress()
+    _save_classify_state()
+    threading.Thread(
+        target=_run_retry_failed,
+        kwargs={"date_str": date_str, "paper_id": paper_id},
+        daemon=True,
+    ).start()
+    return jsonify({
+        "ok": True,
+        "msg": "已触发重试失败论文，可在日志或 /admin/retry-failed/status 查看进度",
+        "date": date_str,
+        "paper_id": paper_id,
+    })
+
+
+@app.route("/admin/retry-failed/status")
+def admin_retry_failed_status():
+    """查询重试任务状态（复用 run-second 的 state）。"""
+    auth_error = _admin_auth_error()
+    if auth_error:
+        return auth_error
+    out = _get_classify_state_snapshot()
+    out["ok"] = True
+    return jsonify(out)
+
+
+def _run_retry_failed(date_str: str, paper_id: Optional[str] = None) -> None:
+    global _classify_state
+    import send as send_mod
+
+    try:
+        llm_config = _build_llm_config_from_env()
+        stats = send_mod.retry_failed_from_json(
+            date_str,
+            llm_config,
+            paper_id=paper_id,
+            progress_callback=_update_classify_progress,
+        )
+        with _index_lock:
+            _index_cache.clear()
+            _index_mtime.clear()
+        _classify_state["last_stats"] = stats
+        total = stats.get("to_retry") or 0
+        bar = send_mod.format_progress_bar(total, total) if total else ""
+        _classify_state["progress"] = {
+            "current": total,
+            "total": total,
+            "percent": 100 if total else 0,
+            "bar": bar,
+            "paper_id": "",
+            "title": "",
+        }
+        _classify_state["last_status"] = (
+            f"完成 {bar} 解读成功={stats.get('analysis_ok', 0)} "
+            f"解读失败={stats.get('analysis_failed', 0)} "
+            f"筛选成功={stats.get('classify_ok', 0)} "
+            f"筛选失败={stats.get('classify_failed', 0)} "
+            f"无需重试={stats.get('skipped', 0)}"
+        )
+    except Exception as e:
+        log.exception(f"重试失败论文异常: {e}")
+        _classify_state["last_status"] = f"失败: {e}"
+    finally:
+        _classify_state["running"] = False
+        _classify_state["task_type"] = None
+        _save_classify_state()
+        _release_classify_lock()
+
+
+@app.route("/admin/add-extra", methods=["POST"])
+def admin_add_extra():
+    """添加额外论文（加餐）：传入 paper_ids 数组，自动抓取+解读+筛选。"""
+    auth_error = _admin_auth_error()
+    if auth_error:
+        return auth_error
+
+    payload = request.get_json(silent=True) or {}
+    date_str = str(payload.get("date") or "").strip()
+    if not date_str:
+        date_str = datetime.now(BJ_TZ).strftime("%Y-%m-%d")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_str):
+        return jsonify({"ok": False, "msg": "invalid date, use YYYY-MM-DD"}), 400
+
+    paper_ids_raw = payload.get("paper_ids") or payload.get("paper_id") or ""
+    if isinstance(paper_ids_raw, str):
+        # 按换行 / 空白切分。注意：不按逗号切分，以免破坏含逗号的 URL（如 openreview 链接）。
+        # 用户可用空格或换行分隔多个 id / 链接。
+        paper_ids = [p.strip() for p in paper_ids_raw.split() if p.strip()]
+    elif isinstance(paper_ids_raw, list):
+        paper_ids = [str(p).strip() for p in paper_ids_raw if str(p).strip()]
+    else:
+        paper_ids = []
+
+    if not paper_ids:
+        return jsonify({"ok": False, "msg": "请提供 paper_ids（arXiv ID 或 PDF 链接，数组或空格/换行分隔字符串）"}), 400
+
+    json_path = DATA_DIR / f"{date_str}.json"
+    if not json_path.is_file():
+        return jsonify({"ok": False, "msg": f"no data for {date_str}, 请先 run-now 生成当日数据"}), 404
+
+    if _get_classify_state_snapshot().get("running"):
+        return jsonify({"ok": False, "msg": "another task already running"}), 409
+    if not _try_acquire_classify_lock():
+        return jsonify({"ok": False, "msg": "another task already running"}), 409
+
+    _classify_state["running"] = True
+    _classify_state["last_run"] = datetime.now(BJ_TZ).isoformat()
+    _classify_state["last_status"] = f"添加额外论文中 date={date_str} ids={paper_ids}"
+    _classify_state["task_type"] = "add-extra"
+    _reset_classify_progress()
+    _save_classify_state()
+    threading.Thread(
+        target=_run_add_extra,
+        kwargs={"date_str": date_str, "paper_ids": paper_ids},
+        daemon=True,
+    ).start()
+    return jsonify({
+        "ok": True,
+        "msg": f"已触发添加 {len(paper_ids)} 篇额外论文",
+        "date": date_str,
+        "paper_ids": paper_ids,
+    })
+
+
+def _run_add_extra(date_str: str, paper_ids: list) -> None:
+    global _classify_state
+    import send as send_mod
+
+    try:
+        llm_config = _build_llm_config_from_env()
+        stats = send_mod.add_extra_papers(
+            date_str,
+            paper_ids,
+            llm_config,
+            progress_callback=_update_classify_progress,
+        )
+        with _index_lock:
+            _index_cache.clear()
+            _index_mtime.clear()
+        _classify_state["last_stats"] = stats
+        _classify_state["progress"] = {
+            "current": len(paper_ids),
+            "total": len(paper_ids),
+            "percent": 100,
+            "bar": send_mod.format_progress_bar(len(paper_ids), len(paper_ids)),
+            "paper_id": "",
+            "title": "",
+        }
+        _classify_state["last_status"] = (
+            f"完成 解读成功={stats.get('analysis_ok', 0)} "
+            f"筛选成功={stats.get('classify_ok', 0)} "
+            f"重复跳过={stats.get('skipped_existing', 0)}"
+        )
+    except Exception as e:
+        log.exception(f"添加额外论文异常: {e}")
+        _classify_state["last_status"] = f"失败: {e}"
+    finally:
+        _classify_state["running"] = False
+        _classify_state["task_type"] = None
+        _save_classify_state()
+        _release_classify_lock()
 
 
 @app.route("/admin/status")
@@ -2372,63 +3644,218 @@ def admin_status():
     auth_error = _admin_auth_error()
     if auth_error:
         return auth_error
-    if not _scheduler:
+    view = _scheduler_runtime_view()
+    if not view:
         return {"running": False}
     return {
         "running": True,
-        "fire_hour": _scheduler.hour,
-        "fire_minute": _scheduler.minute,
-        "last_run": _scheduler.last_run.isoformat() if _scheduler.last_run else None,
-        "last_status": _scheduler.last_status,
+        "fire_hour": view.get("fire_hour"),
+        "fire_minute": view.get("fire_minute"),
+        "last_run": view.get("last_run"),
+        "last_status": view.get("last_status"),
     }
+
+
+@app.route("/api/daily-status")
+def api_daily_status():
+    """公开接口（无需鉴权）：返回今日解读/筛选状态，供网页横幅展示。"""
+    today = datetime.now(BJ_TZ).strftime("%Y-%m-%d")
+    now = datetime.now(BJ_TZ)
+
+    classify_snapshot = _get_classify_state_snapshot()
+    classify_running = classify_snapshot.get("running", False)
+    classify_task = classify_snapshot.get("task_type")
+    classify_progress = dict(classify_snapshot.get("progress") or {})
+
+    scheduler_view = _scheduler_runtime_view()
+    main_running = bool(scheduler_view.get("main_running"))
+    freshness_wait = scheduler_view.get("freshness_wait")
+
+    next_run = scheduler_view.get("next_run")
+    next_run_human = ""
+    if next_run:
+        try:
+            fire_at = datetime.fromisoformat(next_run)
+            if fire_at.tzinfo is None:
+                fire_at = fire_at.replace(tzinfo=BJ_TZ)
+            delta = fire_at - now
+            hours_left = int(delta.total_seconds() // 3600)
+            mins_left = int((delta.total_seconds() % 3600) // 60)
+            wd = "一二三四五六日"[fire_at.weekday()]
+            next_run_human = (
+                f"周{wd} {fire_at.strftime('%m/%d %H:%M')}"
+                f"（约 {hours_left}小时{mins_left}分钟后）"
+            )
+        except (TypeError, ValueError):
+            next_run = None
+
+    last_main_run_display = ""
+    last_run_raw = scheduler_view.get("last_run")
+    if last_run_raw:
+        try:
+            last_main_run_display = datetime.fromisoformat(last_run_raw).strftime("%H:%M")
+        except (TypeError, ValueError):
+            pass
+    index = load_index(today)
+    has_data = index is not None
+    paper_count = 0
+    extra_count = 0
+    analysis_ok = 0
+    analysis_failed = 0
+    classify_ok = 0
+    classify_failed = 0
+
+    if has_data:
+        papers_list = index.get("papers") or []
+        extra_list = index.get("extra_papers") or []
+        paper_count = len(papers_list)
+        extra_count = len(extra_list)
+        for p in papers_list + extra_list:
+            analysis = (p.get("analysis") or "").strip()
+            if not analysis or analysis.startswith("[LLM") or analysis.startswith("[PDF"):
+                analysis_failed += 1
+            else:
+                analysis_ok += 1
+            if p.get("domain_tags") or (p.get("score") or 0) > 0:
+                classify_ok += 1
+            elif analysis_ok or (analysis and not analysis.startswith("[")):
+                classify_failed += 1
+
+    # ── 5. 判断最近一次运行是否失败 ──
+    last_main_failed = False
+    last_status = scheduler_view.get("last_status") or ""
+    if last_status:
+        if last_status.startswith("失败") or "退出码" in last_status or "异常" in last_status:
+            last_main_failed = True
+
+    # ── 6. 综合状态判定 ──
+    extra_hint = f"，另有 {extra_count} 篇额外论文" if extra_count > 0 else ""
+    if freshness_wait:
+        status = "waiting_update"
+        attempt = freshness_wait.get("attempt", 1)
+        max_att = freshness_wait.get("max_attempts", 1)
+        rem = int(freshness_wait.get("remaining_seconds") or 0)
+        rem_min = rem // 60
+        rem_sec = rem % 60
+        stale = freshness_wait.get("stale_categories") or []
+        stale_hint = f"（未更新: {', '.join(stale)}）" if stale else ""
+        message = (
+            f"arXiv 今日列表尚未更新，第 {attempt}/{max_att} 次检查，"
+            f"{rem_min}分{rem_sec:02d}秒后重试{stale_hint}"
+        )
+    elif main_running:
+        status = "fetching"
+        started = f"（始于 {last_main_run_display}）" if last_main_run_display else ""
+        message = f"正在抓取并解读论文…{started}"
+    elif classify_running:
+        status = "processing"
+        if classify_progress.get("total"):
+            if classify_task == "run-second":
+                msg_type = "筛选"
+            elif classify_task == "retry-failed":
+                msg_type = "重试"
+            elif classify_task == "add-extra":
+                msg_type = "添加额外论文"
+            else:
+                msg_type = "处理"
+            message = (
+                f"正在{msg_type} {classify_progress.get('current', 0)}/"
+                f"{classify_progress.get('total', 0)}"
+                f"（{classify_progress.get('percent', 0)}%）"
+            )
+        else:
+            message = "正在处理…"
+    elif last_main_failed:
+        status = "failed"
+        message = "今日解读遇到问题，请联系管理员重新加载"
+    elif has_data and analysis_failed > 0 and classify_failed > 0:
+        status = "partial"
+        message = f"今日已解读，但部分论文处理失败（{analysis_failed + classify_failed} 篇待处理）{extra_hint}"
+    elif has_data:
+        status = "complete"
+        message = f"今日解读完成（共 {paper_count} 篇{extra_hint}），下次更新：{next_run_human}"
+    else:
+        status = "waiting"
+        if next_run_human:
+            message = f"今日尚未更新，下次自动更新：{next_run_human}"
+        else:
+            message = "今日尚未更新"
+
+    result = {
+        "ok": True,
+        "status": status,
+        "message": message,
+        "date": today,
+        "now": now.isoformat(),
+        "has_data": has_data,
+        "paper_count": paper_count,
+        "extra_count": extra_count,
+        "analysis_ok": analysis_ok,
+        "analysis_failed": analysis_failed,
+        "classify_ok": classify_ok,
+        "classify_failed": classify_failed,
+        "next_run": next_run,
+        "next_run_human": next_run_human,
+        "main_running": main_running,
+        "classify_running": classify_running,
+        "classify_task": classify_task,
+        "freshness_wait": freshness_wait,
+    }
+    if classify_running:
+        result["progress"] = classify_progress
+
+    return _apply_no_cdn_cache(jsonify(result))
 
 
 # ─────────────────────────────────────────────
 # 入口
 # ─────────────────────────────────────────────
 
-_scheduler: Optional[DailyScheduler] = None
-
 
 def main() -> None:
-    global _scheduler
     host = os.environ.get("WEB_HOST", "127.0.0.1")
     port = int(os.environ.get("WEB_PORT", "8080"))
-    threads = int(os.environ.get("WEB_THREADS", "8"))
-    hour = int(os.environ.get("DAILY_HOUR", "10"))
-    minute = int(os.environ.get("DAILY_MINUTE", "0"))
-    run_script = Path(os.environ.get("RUN_SCRIPT", str(ROOT / "run.sh"))).resolve()
-    categories = os.environ.get("ARXIV_CHECK_CATEGORIES", "eess.AS cs.SD").split()
-    feishu_webhook_url = os.environ.get("FEISHU_WEBHOOK_URL", "")
+    server = os.environ.get("WEB_SERVER", "gunicorn").strip().lower()
 
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if server == "waitress":
+        threads = int(os.environ.get("WEB_THREADS", "8"))
+        init_background_services()
+        try:
+            from waitress import serve
+        except ImportError as e:
+            raise SystemExit(
+                "缺少 waitress：请先安装（例如 uv sync 或 pip install waitress）"
+            ) from e
+        log.info(f"🌐 启动 Web 服务 http://{host}:{port} (waitress, threads={threads})")
+        log.info(f"🔐 认证: {auth.config_summary()}")
+        serve(app, host=host, port=port, threads=threads)
+        return
 
-    _scheduler = DailyScheduler(
-        hour=hour,
-        minute=minute,
-        run_script=run_script,
-        categories=categories,
-        feishu_webhook_url=feishu_webhook_url,
-    )
-    _scheduler.start()
+    if server == "gunicorn":
+        workers = os.environ.get("WEB_WORKERS", "48")
+        log.info(f"🌐 启动 Web 服务 http://{host}:{port} (gunicorn, workers={workers})")
+        log.info(f"🔐 认证: {auth.config_summary()}")
+        gunicorn_bin = Path(sys.executable).with_name("gunicorn")
+        gunicorn_args = [
+            str(gunicorn_bin) if gunicorn_bin.is_file() else "gunicorn",
+            "-c",
+            str(ROOT / "gunicorn.conf.py"),
+            "web:app",
+        ]
+        if not gunicorn_bin.is_file():
+            try:
+                import gunicorn  # noqa: F401
+            except ImportError as e:
+                raise SystemExit(
+                    "缺少 gunicorn：请先安装（例如 uv pip install gunicorn 或 pip install -r requirements.txt）"
+                ) from e
+        os.execv(gunicorn_args[0], gunicorn_args)
 
-    static_assets.refresh()
-
-    ccf_catalog.start_background_refresh()
-
-    # 启动 ASLP 新闻/公告每小时刷新
-    aslp_feed.start_background_refresh()
-
-    try:
-        from waitress import serve
-    except ImportError as e:
-        raise SystemExit("缺少生产 WSGI server：请先安装 waitress（例如 uv sync 或 pip install waitress）") from e
-
-    log.info(f"🌐 启动 Web 服务 http://{host}:{port} (waitress, threads={threads})")
-    log.info(f"🔐 认证: {auth.config_summary()}")
-    serve(app, host=host, port=port, threads=threads)
+    raise SystemExit(f"未知 WEB_SERVER: {server!r}（可选: gunicorn, waitress）")
 
 
 if __name__ == "__main__":
-    main()
+    if "--scheduler" in sys.argv:
+        run_scheduler_daemon()
+    else:
+        main()

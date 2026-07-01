@@ -34,6 +34,8 @@
   </div>
 </section>
 
+<div class="status-banner" id="status-banner" style="display:none"></div>
+
 <aside class="lab-feed" id="lab-feed" style="display:none">
   <div class="lab-feed-head">
     <span class="lab-feed-title">📢 ASLP 实验室动态</span>
@@ -75,22 +77,32 @@
     <button class="lc-btn active" data-sort="index" onclick="ArxivApp.setSort('index',this)">原始序号 #</button>
     <button class="lc-btn" data-sort="likes" onclick="ArxivApp.setSort('likes',this)">点赞数</button>
     <button class="lc-btn" data-sort="comments" onclick="ArxivApp.setSort('comments',this)">评论数</button>
+    <button class="lc-btn" data-sort="score" onclick="ArxivApp.setSort('score',this)">⭐ 评分</button>
   </div>
   <div class="lc-group lc-expand">
     <button class="lc-btn" onclick="ArxivApp.expandAll()">展开全部</button>
     <button class="lc-btn" onclick="ArxivApp.collapseAll()">折叠全部</button>
+  </div>
+  <div class="lc-group lc-blacklist">
+    <button type="button" class="lc-btn" id="lc-blacklist-btn" onclick="ArxivApp.toggleBlacklistHide(this)">🚫 隐藏黑名单</button>
   </div>
   <div class="lc-group lc-community">
     <span class="lc-label">画线</span>
     <button type="button" class="lc-btn active" id="lc-community-btn" onclick="ArxivApp.toggleCommunityMarks(this)">公共画线</button>
   </div>
 </section>
+<div class="domain-filter-bar" id="domain-filter-bar" style="display:none"></div>
+<div class="grade-filter-bar" id="grade-filter-bar" style="display:none"></div>
 <div id="paper-container" class="paper-list-dynamic">
   <div class="loading-indicator">加载论文中...</div>
 </div>
 
 <!-- 浮动操作按钮 + 目录抽屉 -->
 <div class="fab-stack" id="fab-stack" style="display:none">
+  <button class="fab" type="button" title="阅读列表" aria-label="阅读列表" onclick="ArxivApp.toggleReadingList()">
+    <svg viewBox="0 0 16 16" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M1 2.828c.885-.37 2.154-.769 3.388-.893 1.33-.134 2.678.208 3.701.788.72.4 1.438.855 2.062 1.292.624-.437 1.342-.892 2.062-1.292 1.023-.58 2.371-.922 3.701-.788 1.234.124 2.503.523 3.388.893L9 6.731V13.5a1.5 1.5 0 0 1-1.5 1.5h-5A1.5 1.5 0 0 1 1 13.5V6.731z"/></svg>
+    <span class="fab-badge" id="reading-unread-badge" style="display:none"></span>
+  </button>
   <button class="fab" type="button" title="展开目录" aria-label="展开目录" onclick="ArxivApp.toggleToc()">
     <svg viewBox="0 0 16 16" width="20" height="20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M2.5 12a.5.5 0 0 1 .5-.5h10a.5.5 0 0 1 0 1H3a.5.5 0 0 1-.5-.5m0-4a.5.5 0 0 1 .5-.5h10a.5.5 0 0 1 0 1H3a.5.5 0 0 1-.5-.5m0-4a.5.5 0 0 1 .5-.5h10a.5.5 0 0 1 0 1H3a.5.5 0 0 1-.5-.5"/></svg>
   </button>
@@ -113,8 +125,21 @@
 </aside>
 <div class="toc-backdrop" id="toc-backdrop" onclick="ArxivApp.toggleToc()"></div>
 
+<aside class="reading-drawer" id="reading-drawer" aria-label="阅读列表">
+  <div class="reading-drawer-head">
+    <span class="reading-drawer-title">阅读列表</span>
+    <a class="reading-drawer-all" href="{{ url_for('my_reading_list_page') }}">全部</a>
+    <button class="reading-drawer-close" type="button" aria-label="关闭阅读列表" onclick="ArxivApp.toggleReadingList()">&times;</button>
+  </div>
+  <p class="reading-drawer-hint">👍 点赞加入列表，再次点击取消会从列表移除</p>
+  <ul class="reading-list" id="reading-drawer-list"></ul>
+</aside>
+<div class="reading-backdrop" id="reading-backdrop" onclick="ArxivApp.toggleReadingList()"></div>
+
 <script src="{{ static_asset('highlights.js') }}"></script>
 <script src="{{ static_asset('app.js') }}"></script>
+<link rel="stylesheet" href="{{ static_asset('askai.css') }}">
+<script src="{{ static_asset('askai.js') }}"></script>
 <script>
   ArxivApp.init('{{ date }}', {% if current_user %}'{{ current_user }}'{% else %}null{% endif %}, '{{ papers_digest or "" }}');
 </script>

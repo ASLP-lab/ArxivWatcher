@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+{% block title %}阅读列表 · arXiv 每日精读{% endblock %}
+
+{% block content %}
+<section class="page-header">
+  <h1>阅读列表</h1>
+  <p class="subtitle">点赞加入、取消点赞移除；勾选表示已读</p>
+</section>
+
+<div class="reading-list-summary" id="reading-summary"></div>
+<div id="reading-list-container">
+  <div class="loading-indicator">加载中...</div>
+</div>
+
+<script>
+(function () {
+  var container = document.getElementById('reading-list-container');
+  var summary = document.getElementById('reading-summary');
+
+  function escapeHtml(s) {
+    var d = document.createElement('div');
+    d.textContent = s || '';
+    return d.innerHTML;
+  }
+
+  function paperUrl(date, paperId) {
+    return '/date/' + encodeURIComponent(date) + '#paper-' + encodeURIComponent(paperId);
+  }
+
+  function setRead(date, paperId, read, checkbox) {
+    fetch('/api/reading-list/read', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ date: date, paper_id: paperId, read: read }),
+    }).then(function (r) { return r.json(); }).then(function (d) {
+      if (!d.ok) {
+        if (checkbox) checkbox.checked = !read;
+        if (d.msg && d.msg.indexOf('cookie') >= 0 && typeof showAuthModal === 'function') showAuthModal();
+        return;
+      }
+      var row = checkbox ? checkbox.closest('.reading-item') : null;
+      if (row) row.classList.toggle('is-read', read);
+      updateSummaryFromDom();
+    }).catch(function () {
+      if (checkbox) checkbox.checked = !read;
+    });
+  }
+
+  function updateSummaryFromDom() {
+    var rows = container.querySelectorAll('.reading-item');
+    var unread = 0;
+    rows.forEach(function (row) { if (!row.classList.contains('is-read')) unread += 1; });
+    summary.textContent = rows.length
+      ? ('共 ' + rows.length + ' 篇，未读 ' + unread + ' 篇')
+      : '';
+  }
+
+  fetch('/api/reading-list-all', { credentials: 'same-origin' })
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      if (!d.ok) {
+        container.innerHTML = '<div class="empty-hint">' + escapeHtml(d.msg || '加载失败') + '</div>';
+        if (d.msg && d.msg.indexOf('cookie') >= 0) {
+          container.innerHTML += '<p class="empty-hint"><a href="#" onclick="showAuthModal();return false">启用访客 cookie</a> 或登录后使用阅读列表。</p>';
+        }
+        return;
+      }
+      var byDate = d.by_date || {};
+      var dates = Object.keys(byDate).sort().reverse();
+      if (!dates.length) {
+        container.innerHTML = '<div class="empty-hint">还没有阅读项。在论文页点赞 👍 后会加入，取消点赞会移除。</div>';
+        summary.textContent = '';
+        return;
+      }
+      summary.textContent = '共 ' + (d.items || []).length + ' 篇，未读 ' + (d.unread || 0) + ' 篇';
+      var html = '';
+      dates.forEach(function (date) {
+        html += '<div class="reading-date-group">';
+        html += '<h2 class="reading-date-title"><a href="/date/' + escapeHtml(date) + '">' + escapeHtml(date) + '</a></h2>';
+        html += '<ul class="reading-list">';
+        (byDate[date] || []).forEach(function (item) {
+          var read = !!item.read;
+          html += '<li class="reading-item' + (read ? ' is-read' : '') + '">';
+          html += '<label class="reading-check" title="已读">';
+          html += '<input type="checkbox"' + (read ? ' checked' : '') + ' data-date="' + escapeHtml(item.date) + '" data-pid="' + escapeHtml(item.paper_id) + '">';
+          html += '<span class="reading-check-box" aria-hidden="true"></span>';
+          html += '</label>';
+          html += '<a class="reading-item-link" href="' + escapeHtml(paperUrl(item.date, item.paper_id)) + '">';
+          html += '<span class="reading-item-title">' + escapeHtml(item.title || item.paper_id) + '</span>';
+          html += '<span class="reading-item-meta">' + escapeHtml(item.paper_id) + '</span>';
+          html += '</a>';
+          html += '</li>';
+        });
+        html += '</ul></div>';
+      });
+      container.innerHTML = html;
+      container.querySelectorAll('.reading-check input').forEach(function (cb) {
+        cb.addEventListener('change', function () {
+          setRead(cb.dataset.date, cb.dataset.pid, cb.checked, cb);
+        });
+      });
+    })
+    .catch(function () {
+      container.innerHTML = '<div class="empty-hint">加载失败，请刷新重试。</div>';
+    });
+})();
+</script>
+{% endblock %}

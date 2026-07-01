@@ -30,16 +30,14 @@ data/papers/
 static/_h/
 
 # Runtime data & secrets (never publish)
-data/*.json
-data/*.db
-data/*.db-shm
-data/*.db-wal
-data/.secret_key
-data/papers/
+data/
 
 # Internal deployment scripts (credentials, LDAP, tokens, proxies)
 start_web_internal.sh
 run_internal.sh
+llm_config.sh
+blacklist.txt
+highlight_authors.txt
 
 # Local / internal only (do not publish)
 .git_back/

@@ -1,0 +1,332 @@
+{% extends "base.html" %}
+{% block title %}MCP 接入 — arXiv 每日精读{% endblock %}
+
+{% block content %}
+<section class="page-header">
+  <h1>🔌 MCP 接入指南</h1>
+  <p class="subtitle">把本站每日论文数据接入你的 AI 编程助手（Cursor / Claude Code / Codex），让 AI 直接读取论文、精读解读和全文。</p>
+</section>
+
+<section class="mcp-intro">
+  <div class="mcp-intro-card">
+    <h3>这是什么？</h3>
+    <p>本站实现了 <a href="https://modelcontextprotocol.io" target="_blank" rel="noopener">Model Context Protocol (MCP)</a> 服务端。接入后，你的 AI 终端工具就能像调用函数一样查询本站论文数据——例如「帮我看看今天有哪些 🔥 必读论文」「找一下 XXX 作者最近的工作」「读一下 2402.12345 的精读解读」。</p>
+  </div>
+  <div class="mcp-intro-card">
+    <h3>端点地址</h3>
+    <p>所有工具的接入地址都一样：</p>
+    <code class="mcp-endpoint" id="mcp-endpoint">{{ mcp_endpoint }}</code>
+    <button class="mcp-copy-btn" data-copy="{{ mcp_endpoint }}">复制</button>
+    <p class="mcp-note">提示：如果你通过内网/局域网访问，请把上面的域名换成你实际能访问的地址。</p>
+    <p class="mcp-note">⚠️ 这个地址是给 <strong>AI 工具（POST 请求）</strong>用的，不是给人用浏览器打开的。直接在浏览器访问会看到 <code>405 Method Not Allowed</code>，这是正常的——说明端点在线。本说明页（你正在看的）的地址是 <code>/mcp-guide</code>。</p>
+  </div>
+</section>
+
+<section class="mcp-section">
+  <h2>📋 提供的工具</h2>
+  <p class="mcp-section-sub">接入后，AI 会自动看到以下工具（全部只读，不会改动你的任何数据）：</p>
+
+  <h3 class="mcp-tool-group">📄 论文内容</h3>
+  <div class="mcp-tools-grid">
+    <div class="mcp-tool">
+      <h4><code>list_dates</code></h4>
+      <p>列出所有可用日期（倒序）。了解有哪些数据。</p>
+    </div>
+    <div class="mcp-tool">
+      <h4><code>list_papers</code></h4>
+      <p>列出某天的全部论文（标题/作者/评分/推荐等级/领域）。传 <code>include_analysis=true</code> 可一次性带上全部精读解读，让 AI 直接按内容筛选。</p>
+    </div>
+    <div class="mcp-tool">
+      <h4><code>get_paper</code></h4>
+      <p>取单篇论文完整信息：<strong>元数据 + LLM 精读解读全文</strong>。最常用。</p>
+    </div>
+    <div class="mcp-tool">
+      <h4><code>search_papers</code></h4>
+      <p>跨所有日期按关键词搜索（标题/作者/分类码/id）。</p>
+    </div>
+    <div class="mcp-tool">
+      <h4><code>get_paper_fulltext</code></h4>
+      <p>取 PDF 提取的全文（首次较慢，按需用）。</p>
+    </div>
+  </div>
+
+  <h3 class="mcp-tool-group">💬 社区互动（只读）</h3>
+  <div class="mcp-tools-grid">
+    <div class="mcp-tool">
+      <h4><code>get_interactions</code></h4>
+      <p>某天所有论文的 👍点赞 / 👎踩 / 💬评论数（按热度排序）。看哪些论文被讨论。</p>
+    </div>
+    <div class="mcp-tool">
+      <h4><code>get_comments</code></h4>
+      <p>取某篇（或某天全部）论文的评论。含评论者、内容、时间。</p>
+    </div>
+    <div class="mcp-tool">
+      <h4><code>get_community_highlights</code></h4>
+      <p>某篇论文的社区标注聚合（去重、匿名）——大家都标了哪些关键句。</p>
+    </div>
+    <div class="mcp-tool">
+      <h4><code>get_site_stats</code></h4>
+      <p>站点访问统计：今日/累计访问量、活跃用户、最近 N 天趋势。</p>
+    </div>
+  </div>
+</section>
+
+<section class="mcp-section">
+  <h2>1️⃣ Cursor</h2>
+  <p>Cursor 通过 <code>mcp.json</code> 配置文件接入。二选一：</p>
+  <div class="mcp-tabs">
+    <button class="mcp-tab active" data-tab="cursor-file">配置文件（推荐）</button>
+    <button class="mcp-tab" data-tab="cursor-ui">GUI</button>
+  </div>
+
+  <div class="mcp-tab-content active" data-tab="cursor-file">
+    <p>编辑配置文件（全局：<code>~/.cursor/mcp.json</code>；项目级：<code>.cursor/mcp.json</code>）：</p>
+    <pre><code>{
+  "mcpServers": {
+    "arxivwatcher": {
+      "url": "{{ mcp_endpoint }}"
+    }
+  }
+}</code></pre>
+    <p>保存后重启 Cursor。进入 <strong>Settings → Tools & MCP</strong> 可看到 <code>arxivwatcher</code> 已连接。</p>
+  </div>
+
+  <div class="mcp-tab-content" data-tab="cursor-ui">
+    <p>在 Cursor 中：<strong>Settings → Tools & MCP → + Add new MCP Server</strong></p>
+    <ul>
+      <li><strong>Type</strong>: <code>streamableHttp</code></li>
+      <li><strong>Name</strong>: <code>arxivwatcher</code></li>
+      <li><strong>URL</strong>: <code>{{ mcp_endpoint }}</code></li>
+    </ul>
+    <p>本站 MCP 端点公开无需鉴权，Headers 留空即可。</p>
+  </div>
+</section>
+
+<section class="mcp-section">
+  <h2>2️⃣ Claude Code</h2>
+  <p>用命令行添加（推荐），或手动写 JSON 配置：</p>
+  <div class="mcp-tabs">
+    <button class="mcp-tab active" data-tab="cc-cli">命令行（推荐）</button>
+    <button class="mcp-tab" data-tab="cc-json">JSON 配置</button>
+  </div>
+
+  <div class="mcp-tab-content active" data-tab="cc-cli">
+    <p>在终端运行：</p>
+    <pre><code>claude mcp add --transport http arxivwatcher {{ mcp_endpoint }}</code></pre>
+    <p>作用域默认 <code>local</code>（仅当前项目）。全局可用加 <code>--scope user</code>。</p>
+    <pre><code>claude mcp add --transport http --scope user arxivwatcher {{ mcp_endpoint }}</code></pre>
+    <p>验证：运行 <code>claude mcp list</code>，应看到 <code>arxivwatcher</code>。</p>
+  </div>
+
+  <div class="mcp-tab-content" data-tab="cc-json">
+    <p>编辑 <code>~/.claude.json</code>（或项目根 <code>.mcp.json</code>）：</p>
+    <pre><code>{
+  "mcpServers": {
+    "arxivwatcher": {
+      "type": "http",
+      "url": "{{ mcp_endpoint }}"
+    }
+  }
+}</code></pre>
+    <p class="mcp-note">注意：Claude Code 用 <code>"type": "http"</code>（不是 <code>streamable-http</code>）。</p>
+  </div>
+</section>
+
+<section class="mcp-section">
+  <h2>3️⃣ Codex (OpenAI CLI)</h2>
+  <p>Codex 用 TOML 配置文件 <code>~/.codex/config.toml</code>（或项目级 <code>.codex/config.toml</code>）：</p>
+  <div class="mcp-tabs">
+    <button class="mcp-tab active" data-tab="codex-toml">配置文件</button>
+    <button class="mcp-tab" data-tab="codex-cli">命令行</button>
+  </div>
+
+  <div class="mcp-tab-content active" data-tab="codex-toml">
+    <p>编辑 <code>~/.codex/config.toml</code>，加入：</p>
+    <pre><code>[mcp_servers.arxivwatcher]
+url = "{{ mcp_endpoint }}"
+enabled = true</code></pre>
+    <p>本站无需鉴权，因此不需要 <code>bearer_token_env_var</code>。</p>
+  </div>
+
+  <div class="mcp-tab-content" data-tab="codex-cli">
+    <p>在终端运行：</p>
+    <pre><code>codex mcp add arxivwatcher --url {{ mcp_endpoint }}</code></pre>
+    <p>启动 Codex 后运行 <code>/mcp</code> 验证连接。</p>
+  </div>
+</section>
+
+<section class="mcp-section">
+  <h2>✅ 验证</h2>
+  <p>接入后，在任一工具里试着对 AI 说：</p>
+  <ul class="mcp-examples">
+    <li>「列出最近的论文日期」</li>
+    <li>「看一下 2026-06-18 有哪些 🔥 必读论文」</li>
+    <li>「把 2026-06-18 的论文连同精读解读一起读一遍，帮我挑出和语音分离相关的」（AI 会用 <code>list_papers</code> + <code>include_analysis=true</code>）</li>
+    <li>「读一下论文 2402.12345 的精读解读」（需替换为真实 id）</li>
+    <li>「搜索作者 Zhang 最近发表的论文」</li>
+    <li>「2026-06-18 哪些论文被讨论得最多？」（<code>get_interactions</code>）</li>
+    <li>「看看论文 2402.12345 大家都评论了什么」（<code>get_comments</code>）</li>
+    <li>「这个站最近访问量怎么样？」（<code>get_site_stats</code>）</li>
+  </ul>
+  <p>AI 会自动调用上面的工具并把结果总结给你。</p>
+</section>
+
+<section class="mcp-section mcp-faq">
+  <h2>❓ 常见问题</h2>
+  <details>
+    <summary>数据会经过服务器外的第三方吗？</summary>
+    <p>不会。MCP 端点直接由本站提供，工具调用的请求/响应都在你和本站之间。AI 工具会把返回的论文内容作为上下文送给它配置的 LLM（如 Claude/GPT），这部分由你使用的工具决定。</p>
+  </details>
+  <details>
+    <summary>连接失败 / 工具不显示？</summary>
+    <ul>
+      <li>确认端点 URL 在你的网络可达（内网部署需用内网地址）。</li>
+      <li>Claude Code 用 <code>type: http</code>，Cursor 直接用 <code>url</code>，Codex 用 TOML 的 <code>[mcp_servers.xxx]</code>。</li>
+      <li>改完配置记得重启对应工具。</li>
+    </ul>
+  </details>
+  <details>
+    <summary>支持流式输出吗？</summary>
+    <p>本端点遵循 MCP Streamable HTTP 规范，POST 返回标准 JSON-RPC 响应。由于工具都是即时只读查询，未启用 SSE 长流；这对所有三个客户端完全兼容。</p>
+  </details>
+</section>
+{% endblock %}
+
+{% block head_extra %}
+<style>
+/* ── MCP 页面样式 ── */
+.mcp-intro { display: grid; grid-template-columns: 1.4fr 1fr; gap: 16px; margin-bottom: 32px; }
+@media (max-width: 760px) { .mcp-intro { grid-template-columns: 1fr; } }
+.mcp-intro-card {
+  background: var(--card-bg, #fff);
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 10px;
+  padding: 18px 20px;
+}
+.mcp-intro-card h3 { margin: 0 0 8px; font-size: 15px; color: var(--fg, #1a1a1a); }
+.mcp-intro-card p { margin: 0 0 8px; font-size: 13px; line-height: 1.6; color: var(--fg-muted, #555); }
+.mcp-intro-card a { color: #6d28d9; }
+.mcp-endpoint {
+  display: inline-block;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  background: #f5f3ff;
+  border: 1px solid #ddd6fe;
+  color: #5b21b6;
+  padding: 6px 10px;
+  border-radius: 6px;
+  max-width: 100%;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+.mcp-copy-btn {
+  font-size: 12px; padding: 5px 12px; margin-left: 6px;
+  border: 1px solid var(--border, #e5e7eb); border-radius: 6px;
+  background: #fff; cursor: pointer; color: var(--fg, #1a1a1a);
+}
+.mcp-copy-btn:hover { background: #f5f3ff; border-color: #ddd6fe; }
+.mcp-note { font-size: 12px; color: var(--fg-muted, #888); margin-top: 6px; }
+
+.mcp-section { margin-bottom: 36px; }
+.mcp-section h2 { font-size: 19px; margin: 0 0 8px; color: var(--fg, #1a1a1a); }
+.mcp-section-sub { font-size: 13px; color: var(--fg-muted, #666); margin: 0 0 14px; }
+.mcp-tool-group { font-size: 14px; color: #6d28d9; margin: 20px 0 10px; padding-bottom: 4px; border-bottom: 1px dashed #ddd6fe; }
+
+.mcp-tools-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
+.mcp-tool { background: #fafaf8; border: 1px solid var(--border, #e5e7eb); border-radius: 8px; padding: 12px 14px; }
+.mcp-tool h4 { margin: 0 0 4px; font-size: 13px; }
+.mcp-tool h4 code { color: #6d28d9; font-weight: 700; }
+.mcp-tool p { margin: 0; font-size: 12px; line-height: 1.5; color: var(--fg-muted, #666); }
+
+.mcp-tabs { display: flex; gap: 4px; margin-bottom: 14px; border-bottom: 1px solid var(--border, #e5e7eb); }
+.mcp-tab {
+  border: none; background: none; cursor: pointer;
+  padding: 8px 14px; font-size: 13px; color: var(--fg-muted, #666);
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
+}
+.mcp-tab.active { color: #6d28d9; border-bottom-color: #6d28d9; font-weight: 600; }
+.mcp-tab:hover { color: #5b21b6; }
+.mcp-tab-content { display: none; }
+.mcp-tab-content.active { display: block; }
+.mcp-tab-content p { font-size: 13px; line-height: 1.6; margin: 0 0 10px; }
+
+.mcp-section pre {
+  background: #1e1e2e; color: #cdd6f4;
+  border-radius: 8px; padding: 14px 16px;
+  font-size: 12.5px; line-height: 1.6;
+  overflow-x: auto; margin: 0 0 12px;
+}
+.mcp-section code {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12.5px;
+}
+.mcp-section p code, .mcp-section li code {
+  background: #f3f4f6; padding: 1px 5px; border-radius: 4px; color: #5b21b6;
+}
+
+.mcp-examples { font-size: 13px; line-height: 1.9; padding-left: 20px; }
+.mcp-examples li { color: var(--fg, #333); }
+
+.mcp-faq details {
+  border: 1px solid var(--border, #e5e7eb); border-radius: 8px;
+  padding: 12px 16px; margin-bottom: 8px; background: #fff;
+}
+.mcp-faq summary { cursor: pointer; font-size: 14px; font-weight: 600; color: var(--fg, #1a1a1a); }
+.mcp-faq details[open] summary { margin-bottom: 8px; }
+.mcp-faq details p, .mcp-faq details ul { font-size: 13px; line-height: 1.6; color: var(--fg-muted, #555); margin: 6px 0; }
+.mcp-faq details ul { padding-left: 20px; }
+
+/* ── 深色模式 ── */
+:root[data-theme="dark"] .mcp-intro-card,
+:root[data-theme="dark"] .mcp-tool,
+:root[data-theme="dark"] .mcp-faq details,
+:root[data-theme="dark"] .mcp-copy-btn { background: #1c1e24; }
+:root[data-theme="dark"] .mcp-endpoint { background: #2a1f45; border-color: #3a2f55; color: #c4b5fd; }
+:root[data-theme="dark"] .mcp-copy-btn:hover { background: #2a1f45; }
+:root[data-theme="dark"] .mcp-section p code,
+:root[data-theme="dark"] .mcp-section li code { background: #232530; color: #c4b5fd; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .mcp-intro-card,
+  :root:not([data-theme="light"]) .mcp-tool,
+  :root:not([data-theme="light"]) .mcp-faq details,
+  :root:not([data-theme="light"]) .mcp-copy-btn { background: #1c1e24; }
+  :root:not([data-theme="light"]) .mcp-endpoint { background: #2a1f45; border-color: #3a2f55; color: #c4b5fd; }
+  :root:not([data-theme="light"]) .mcp-copy-btn:hover { background: #2a1f45; }
+  :root:not([data-theme="light"]) .mcp-section p code,
+  :root:not([data-theme="light"]) .mcp-section li code { background: #232530; color: #c4b5fd; }
+}
+</style>
+{% endblock %}
+
+{% block content_extra %}
+<script>
+/* MCP 页面：Tab 切换 + 复制端点 */
+document.querySelectorAll('.mcp-tab').forEach(function (tab) {
+  tab.addEventListener('click', function () {
+    var section = tab.closest('.mcp-section');
+    section.querySelectorAll('.mcp-tab').forEach(function (t) { t.classList.remove('active'); });
+    section.querySelectorAll('.mcp-tab-content').forEach(function (c) { c.classList.remove('active'); });
+    tab.classList.add('active');
+    var target = section.querySelector('.mcp-tab-content[data-tab="' + tab.dataset.tab + '"]');
+    if (target) target.classList.add('active');
+  });
+});
+document.querySelectorAll('.mcp-copy-btn').forEach(function (btn) {
+  btn.addEventListener('click', function () {
+    var text = btn.getAttribute('data-copy') || '';
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(text).then(function () {
+        var old = btn.textContent; btn.textContent = '已复制 ✓';
+        setTimeout(function () { btn.textContent = old; }, 1500);
+      });
+    } else {
+      var ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta);
+      ta.select(); try { document.execCommand('copy'); } catch (e) {}
+      document.body.removeChild(ta);
+      var old2 = btn.textContent; btn.textContent = '已复制 ✓';
+      setTimeout(function () { btn.textContent = old2; }, 1500);
+    }
+  });
+});
+</script>
+{% endblock %}

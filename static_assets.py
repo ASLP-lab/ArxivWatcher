@@ -15,7 +15,7 @@ log = logging.getLogger("static_assets")
 
 HASH_LEN = 10
 HASHED_DIR_NAME = "_h"
-MANIFEST_FILES = ("style.css", "app.js", "highlights.js")
+MANIFEST_FILES = ("style.css", "askai.css", "app.js", "highlights.js", "askai.js")
 
 _lock = threading.Lock()
 _static_dir: Path | None = None

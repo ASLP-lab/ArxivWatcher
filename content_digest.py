@@ -40,22 +40,29 @@ def paper_analysis_digest(paper: dict) -> Optional[str]:
     return digest_bytes(html.encode("utf-8"))
 
 
+def _process_paper_for_list(p: dict) -> dict:
+    """处理单篇论文，返回不含正文但含 has_analysis / analysis_digest 的副本。"""
+    pp = dict(p)
+    has = bool(pp.get("analysis_html") or pp.get("analysis"))
+    pp["has_analysis"] = has
+    if has:
+        ad = paper_analysis_digest(p)
+        if ad:
+            pp["analysis_digest"] = ad
+    pp.pop("analysis_html", None)
+    pp.pop("analysis", None)
+    return pp
+
+
 def build_papers_list_payload(index: dict) -> dict:
     """构造论文列表 API 响应（不含精读正文，含 analysis_digest）。"""
     data = dict(index)
-    papers_out = []
-    for p in data.get("papers", []):
-        pp = dict(p)
-        has = bool(pp.get("analysis_html") or pp.get("analysis"))
-        pp["has_analysis"] = has
-        if has:
-            ad = paper_analysis_digest(p)
-            if ad:
-                pp["analysis_digest"] = ad
-        pp.pop("analysis_html", None)
-        pp.pop("analysis", None)
-        papers_out.append(pp)
+    papers_out = [_process_paper_for_list(p) for p in data.get("papers", [])]
     data["papers"] = papers_out
+    # 额外论文（加餐）
+    extra_raw = data.get("extra_papers") or []
+    if extra_raw:
+        data["extra_papers"] = [_process_paper_for_list(p) for p in extra_raw]
     return data
 
 

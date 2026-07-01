@@ -9,8 +9,8 @@
 
 LDAP（当 AUTH_METHODS 含 ldap 时生效）：
 
-- LDAP_URI             单个 LDAP 地址（与 LDAP_URLS 二选一），如 "ldap://192.168.0.16"。
-- LDAP_URLS            多个 LDAP 地址（逗号分隔，按顺序 failover），如 "ldap://192.168.0.16,ldap://10.69.48.45"。
+- LDAP_URI             单个 LDAP 地址（与 LDAP_URLS 二选一），如 "ldap://ldap.example.com"。
+- LDAP_URLS            多个地址（逗号分隔，按顺序 failover），如 "ldap://ldap1.example.com,ldap://ldap2.example.com"。
 - LDAP_START_TLS       是否在绑定前 StartTLS（true/false），默认 false。
 
 两种查找用户的方式（二选一）：

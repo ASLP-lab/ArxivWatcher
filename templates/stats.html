@@ -100,4 +100,72 @@
   <p class="empty-hint">还没有任何访问记录</p>
   {% endif %}
 </section>
+
+<section class="stats-section">
+  <div class="stats-section-head">
+    <h2><span class="stats-section-icon">🪙</span> LLM Token 消耗</h2>
+    <span class="stats-section-sub">解读 / 筛选 / 单位识别等后台 LLM 调用累计</span>
+  </div>
+  <div class="stats-hero stats-hero--token-row">
+    <div class="stats-hero-card stats-hero--token-in">
+      <div class="stats-hero-label">今日输入</div>
+      <div class="stats-hero-num">{{ '{:,}'.format(token_today_input) }}</div>
+      <div class="stats-hero-foot">prompt tokens</div>
+    </div>
+    <div class="stats-hero-card stats-hero--token-out">
+      <div class="stats-hero-label">今日输出</div>
+      <div class="stats-hero-num">{{ '{:,}'.format(token_today_output) }}</div>
+      <div class="stats-hero-foot">completion tokens</div>
+    </div>
+    <div class="stats-hero-card stats-hero--token-cache">
+      <div class="stats-hero-label">今日命中</div>
+      <div class="stats-hero-num">{{ '{:,}'.format(token_today_cached) }}</div>
+      <div class="stats-hero-foot">缓存命中 tokens</div>
+    </div>
+    <div class="stats-hero-card stats-hero--token-total">
+      <div class="stats-hero-label">今日合计</div>
+      <div class="stats-hero-num">{{ '{:,}'.format(token_today_total) }}</div>
+      <div class="stats-hero-foot">{{ token_today_calls }} 次调用 · 近 {{ token_day_count }} 天均 {{ '{:g}'.format(token_avg_per_day) }}</div>
+    </div>
+  </div>
+
+  {% if token_recent %}
+  <div class="stats-section-head" style="margin-top:20px">
+    <h3 style="font-size:15px;margin:0">最近 {{ token_recent|length }} 天 Token 合计</h3>
+  </div>
+  <div class="day-chart-wrap">
+    <div class="day-chart">
+      {% for d in token_recent %}
+      <div class="day-col" data-tip="{{ d.date }} → 合计 {{ d.total }}（入 {{ d.input }} / 出 {{ d.output }} / 命中 {{ d.cached }}）">
+        <div class="day-bar-wrap">
+          <div class="day-bar {% if d.is_today %}is-today{% endif %}"
+               style="height: {{ d.pct }}%; background: linear-gradient(180deg, #f59e0b, #fbbf24);"></div>
+        </div>
+        <div class="day-label">{{ d.date[5:] }}</div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  <details class="stats-table-wrap">
+    <summary>查看 Token 每日明细</summary>
+    <table class="stats-table">
+      <thead><tr><th>日期</th><th>输入</th><th>输出</th><th>命中</th><th>合计</th><th>调用</th></tr></thead>
+      <tbody>
+      {% for d in token_recent|reverse %}
+        <tr {% if d.is_today %}class="is-today"{% endif %}>
+          <td><code>{{ d.date }}</code></td>
+          <td>{{ '{:,}'.format(d.input) }}</td>
+          <td>{{ '{:,}'.format(d.output) }}</td>
+          <td>{{ '{:,}'.format(d.cached) }}</td>
+          <td>{{ '{:,}'.format(d.total) }}</td>
+          <td>{{ d.calls }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </details>
+  {% else %}
+  <p class="empty-hint">暂无 Token 记录（部署新统计后，新的 LLM 调用会自动累计）</p>
+  {% endif %}
+</section>
 {% endblock %}

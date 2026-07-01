@@ -177,8 +177,8 @@ python scripts/build_index.py
 | 运行用户 | `app`（非 root） | UID/GID 由系统分配，挂载的宿主目录要可被写入 |
 | 时区 | `Asia/Shanghai` | 定时任务按北京时间触发 |
 | 存储后端 | `sqlite`（`/app/data/app.db`） | Docker 默认 SQLite；想用 JSON 文件设 `-e STORAGE_BACKEND=json` |
-| 默认 CMD | `python web.py` | 启动 Web 服务（含工作日 10:00 定时调度） |
-| ENTRYPOINT | `tini --` | 正确转发信号，waitress 可优雅退出 |
+| 默认 CMD | `gunicorn -c gunicorn.conf.py web:app` | 启动 Web 服务（48 worker，含工作日 10:00 定时调度） |
+| ENTRYPOINT | `tini --` | 正确转发信号，gunicorn 可优雅退出 |
 
 ### docker compose 一键启动
 
@@ -256,7 +256,9 @@ docker buildx build \
 |------|------|------|
 | `WEB_HOST` | `0.0.0.0`（Dockerfile） | Web 监听地址。容器内**必须** `0.0.0.0`，否则端口映射不通 |
 | `WEB_PORT` | `8091`（Dockerfile） | Web 监听端口。容器内建议保持 `8091`，宿主端口用 `-p` 映射 |
-| `WEB_THREADS` | `8`（Dockerfile） | Waitress 工作线程数，高并发可调大 |
+| `WEB_SERVER` | `gunicorn`（Dockerfile） | WSGI 服务：`gunicorn`（默认）或 `waitress`（开发单进程） |
+| `WEB_WORKERS` | `48`（Dockerfile） | Gunicorn worker 进程数 |
+| `WEB_THREADS` | `8` | 仅 `WEB_SERVER=waitress` 时生效，Waitress 工作线程数 |
 | `TZ` | `Asia/Shanghai`（Dockerfile） | 时区。定时任务按此触发 |
 | `WEB_PUBLIC_URL` | 空 | 对外暴露的访问地址。用于飞书消息里的链接、Zotero 插件 `update_url`（须 HTTPS）。例：`https://arxiv.example.com` |
 | `ICP_BEIAN` | 空 | ICP 备案号，设置后页脚显示备案链接，留空则不显示。例：`陕ICP备XXXXX号-1` |
@@ -288,7 +290,7 @@ docker buildx build \
 
 | 变量 | 默认值 | 说明 |
 |------|------|------|
-| `LDAP_URI` | 空 | LDAP 服务地址，如 `ldap://192.168.0.1` |
+| `LDAP_URI` | 空 | LDAP 服务地址，如 `ldap://ldap.example.com` |
 | `LDAP_URLS` | 空 | 多地址 failover（逗号分隔）。设置后**忽略** `LDAP_URI`。例：`ldap://a,ldap://b` |
 | `LDAP_START_TLS` | `false` | 是否启用 STARTTLS（`true`/`false`） |
 | `LDAP_USER_DN_TEMPLATE` | 空 | **方式一·直接绑定**：已知 DN 规则时使用，如 `uid={username},ou=people,dc=example,dc=com` |
@@ -385,7 +387,7 @@ docker run -d --name arxivwatcher \
   -e ADMIN_TOKEN="$(openssl rand -hex 32)" \
   -e AUTH_METHODS=local,ldap \
   -e ALLOW_REGISTER=false \
-  -e LDAP_URI=ldap://192.168.0.16 \
+  -e LDAP_URI=ldap://ldap.example.com \
   -e LDAP_BASE_DN=dc=ldapdomain,dc=com \
   -e LDAP_USER_FILTER='(uid={username})' \
   -e LDAP_BIND_DN=cn=admin,dc=ldapdomain,dc=com \

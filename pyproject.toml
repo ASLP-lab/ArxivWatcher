@@ -5,10 +5,10 @@ description = "ArxivWatcher — arXiv 每日论文监控与精读工具，自动
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
-    { name = "ASLP-lab", email = "g3349495429@163.com" }
+    { name = "ASLP-lab" }
 ]
 maintainers = [
-    { name = "aslplab", email = "g3349495429@163.com" }
+    { name = "ASLP-lab" }
 ]
 license = { text = "CC BY 4.0" }
 keywords = ["arxiv", "watcher", "llm", "paper-digest", "academic", "daily-updates"]
@@ -27,8 +27,11 @@ dependencies = [
     "pypdf>=6.0.0",
     "markdown>=3.0.0",
     "flask>=3.1.3",
+    "gunicorn>=23.0.0",
     "waitress>=3.0.2",
     "bcrypt>=5.0.0",
     "brotli>=1.1.0",
     "ldap3>=2.9.1",
+    "pillow>=12.2.0",
+    "pymupdf>=1.27.2.3",
 ]
