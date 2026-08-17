@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block title %}
-{% if is_today %}今日 · {% endif %}{{ date }} — arXiv 每日精读
+{% if is_today %}今日 · {% endif %}{{ date }} — ArxivWatcher
 {% endblock %}
 
 {% block content %}
@@ -150,4 +150,6 @@
 {% else %}
 <div class="empty-hint">该日期没有报告。</div>
 {% endif %}
+
+{% include "_geo_stats.html" %}
 {% endblock %}

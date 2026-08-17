@@ -38,6 +38,7 @@ RUN python -m venv /opt/venv \
 FROM python:${PYTHON_VERSION}-slim AS runtime
 
 LABEL org.opencontainers.image.title="ArxivWatcher" \
+      org.opencontainers.image.version="2.1.0" \
       org.opencontainers.image.description="arXiv 每日论文监控与精读工具（Web + 定时调度）" \
       org.opencontainers.image.source="https://github.com/ASLP-lab/ArxivWatcher" \
       org.opencontainers.image.url="https://hub.docker.com/r/aslplab/arxivwatcher" \
@@ -63,7 +64,8 @@ COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    TZ=Asia/Shanghai
+    TZ=Asia/Shanghai \
+    ARXIVWATCHER_CONFIG_DIR=/app/config
 
 # 运行时默认环境变量（用户可覆盖）
 ENV WEB_HOST=0.0.0.0 \
@@ -85,16 +87,16 @@ COPY --chown=app:app . /app
 RUN chmod +x /app/run_web.sh
 
 # 运行期可写目录：data / reports / logs / arxiv_digest_work
-RUN mkdir -p /app/data /app/reports /app/logs /app/arxiv_digest_work \
+RUN mkdir -p /app/config /app/data /app/reports /app/logs /app/arxiv_digest_work \
     && chown -R app:app /app
 
 USER app
 
 EXPOSE 8091
 
-# 健康检查：Web 首页
+# 健康检查：极简 204 探针
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD curl -fsS "http://127.0.0.1:${WEB_PORT}/" || exit 1
+    CMD curl -fsS "http://127.0.0.1:${WEB_PORT}/health" || exit 1
 
 # tini 负责正确转发 SIGTERM（gunicorn 会优雅退出）
 ENTRYPOINT ["/usr/bin/tini", "--"]

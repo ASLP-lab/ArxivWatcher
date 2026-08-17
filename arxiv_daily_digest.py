@@ -590,7 +590,7 @@ def generate_html_report(papers: list[Paper], categories: list[str], llm_config:
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>arXiv 每日论文精读 — {_escape_html(cat_labels)} | {today}</title>
+<title>ArxivWatcher — {_escape_html(cat_labels)} | {today}</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
   :root {{
@@ -657,7 +657,7 @@ def generate_html_report(papers: list[Paper], categories: list[str], llm_config:
 <body>
 <div class="container">
   <header class="report-header">
-    <h1>arXiv 每日论文精读</h1>
+    <h1>ArxivWatcher</h1>
     <div class="subtitle">📡 {_escape_html(cat_labels)}</div>
     <div class="subtitle-cats">{_escape_html(cat_names)}</div>
     <div class="date">{today}</div>
@@ -700,7 +700,7 @@ def send_email(html_content: str, categories: list[str], config: dict):
     """通过 SMTP 发送 HTML 邮件。"""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     cat_str = " / ".join(categories)
-    subject = f"📚 arXiv 每日精读 [{cat_str}] — {today}"
+    subject = f"ArxivWatcher [{cat_str}] — {today}"
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
@@ -708,7 +708,7 @@ def send_email(html_content: str, categories: list[str], config: dict):
     msg["To"] = config["email_to"]
 
     msg.attach(MIMEText(
-        f"arXiv 每日论文精读报告 ({cat_str})\n\n请使用支持 HTML 的邮件客户端查看完整报告。",
+        f"ArxivWatcher报告 ({cat_str})\n\n请使用支持 HTML 的邮件客户端查看完整报告。",
         "plain", "utf-8",
     ))
     msg.attach(MIMEText(html_content, "html", "utf-8"))
@@ -731,7 +731,7 @@ def send_email(html_content: str, categories: list[str], config: dict):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="arXiv 每日论文精读 — 多领域 + OpenAI 兼容 API",
+        description="ArxivWatcher — 多领域 + OpenAI 兼容 API",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
@@ -790,7 +790,7 @@ def main():
         sys.exit(1)
 
     log.info("=" * 60)
-    log.info("arXiv 每日论文精读 v2.0")
+    log.info("ArxivWatcher v2.0")
     log.info("=" * 60)
     log.info(f"分类: {', '.join(args.category)}")
     log.info(f"LLM:  {llm_config.model} @ {llm_config.base_url}")

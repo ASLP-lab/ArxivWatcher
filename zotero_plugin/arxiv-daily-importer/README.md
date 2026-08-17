@@ -1,6 +1,6 @@
 # arXiv Daily Importer（Zotero 插件）
 
-Zotero 7+ 插件：自动把 arXiv 每日精读报告的 HTML 下载为本地网页快照并导入库中。
+Zotero 7+ 插件：自动把 ArxivWatcher 每日报告的 HTML 下载为本地网页快照并导入库中。
 
 ## 行为
 

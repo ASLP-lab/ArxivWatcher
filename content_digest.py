@@ -59,6 +59,11 @@ def build_papers_list_payload(index: dict) -> dict:
     data = dict(index)
     papers_out = [_process_paper_for_list(p) for p in data.get("papers", [])]
     data["papers"] = papers_out
+    featured_raw = data.get("featured_papers") or []
+    if featured_raw:
+        data["featured_papers"] = [
+            _process_paper_for_list(p) for p in featured_raw
+        ]
     # 额外论文（加餐）
     extra_raw = data.get("extra_papers") or []
     if extra_raw:

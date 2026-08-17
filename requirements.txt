@@ -8,3 +8,4 @@ flask>=3.0.0
 gunicorn>=23.0.0
 waitress>=3.0.2
 bcrypt>=4.0.0
+geoip2>=5.0

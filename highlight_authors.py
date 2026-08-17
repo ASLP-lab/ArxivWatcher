@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
 import threading
 from pathlib import Path
@@ -11,7 +12,12 @@ from pathlib import Path
 log = logging.getLogger("highlight_authors")
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_PATH = ROOT / "highlight_authors.txt"
+CONFIG_DIR = Path(os.environ.get("ARXIVWATCHER_CONFIG_DIR") or (ROOT / "config"))
+DEFAULT_PATH = (
+    CONFIG_DIR / "highlight_authors.txt"
+    if (CONFIG_DIR / "highlight_authors.txt").exists() or not (ROOT / "highlight_authors.txt").exists()
+    else ROOT / "highlight_authors.txt"
+)
 
 _lock = threading.Lock()
 _names: list[str] = []

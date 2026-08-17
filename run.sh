@@ -10,6 +10,12 @@ fi
 
 export TZ="${TZ:-Asia/Shanghai}"
 
+CONFIG_DIR="${ARXIVWATCHER_CONFIG_DIR:-config}"
+if [ -f "${CONFIG_DIR}/llm_config.sh" ]; then
+  # shellcheck source=/dev/null
+  source "${CONFIG_DIR}/llm_config.sh"
+fi
+
 # ── LLM（OpenAI 兼容接口）──
 : "${LLM_BASE_URL:=https://api.openai.com/v1}"
 : "${LLM_MODEL:=gpt-4o}"

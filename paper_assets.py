@@ -9,10 +9,12 @@
 
 from __future__ import annotations
 
+import fcntl
 import io
 import json
 import logging
 import re
+import os
 import threading
 from pathlib import Path
 from typing import Any, Optional
@@ -35,15 +37,45 @@ REQUEST_HEADERS = {
 
 _ARXIV_ID_RE = re.compile(r"^\d{4}\.\d{4,5}(v\d+)?$", re.I)
 
-_lock_guard = threading.Lock()
-_asset_locks: dict[str, threading.Lock] = {}
+class _FileLock:
+    """跨进程文件锁（基于 fcntl.flock），可用作上下文管理器。"""
+
+    def __init__(self, lock_path: Path):
+        self._path = Path(lock_path)
+        self._fd: "int | None" = None
+
+    def acquire(self, *, blocking: bool = True) -> bool:
+        if self._fd is not None:
+            return True
+        fd = os.open(str(self._path), os.O_CREAT | os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
+            os.close(fd)
+            return False
+        self._fd = fd
+        return True
+
+    def release(self) -> None:
+        if self._fd is None:
+            return
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(self._fd)
+        self._fd = None
+
+    def __enter__(self) -> "_FileLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.release()
 
 
-def _lock_for(key: str) -> threading.Lock:
-    with _lock_guard:
-        if key not in _asset_locks:
-            _asset_locks[key] = threading.Lock()
-        return _asset_locks[key]
+def _file_lock_for(cache_dir: Path) -> _FileLock:
+    return _FileLock(cache_dir / ".lock")
 
 
 def safe_paper_dir_name(paper_id: str) -> str:
@@ -92,6 +124,44 @@ def _save_manifest(cache_dir: Path, manifest: dict) -> None:
 
 def _manifest_fresh(manifest: dict) -> bool:
     return int(manifest.get("manifest_version") or 0) >= MANIFEST_VERSION
+
+
+_peek_stats_lock = threading.Lock()
+_peek_stats_cache: dict = {}
+
+
+def peek_manifest_stats(data_dir: Path, date: str, paper_id: str) -> Optional[dict]:
+    """只读获取已缓存 manifest 的图表统计，不触发扫描 / 下载 / 建目录。
+
+    返回 {"count": 总数, "tables": 表格数}；manifest 缺失或版本过旧返回 None。
+    供列表 API 附带 figure_count，让客户端预留图表区高度，避免加载时页面跳动。
+    """
+    pid = (paper_id or "").strip()
+    if not pid or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date or ""):
+        return None
+    path = manifest_path(data_dir / "_assets" / date / safe_paper_dir_name(pid))
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    key = (date, pid)
+    with _peek_stats_lock:
+        hit = _peek_stats_cache.get(key)
+        if hit and hit[0] == mtime:
+            return hit[1]
+    manifest = _load_manifest(path.parent)
+    stats = None
+    if manifest and _manifest_fresh(manifest) and manifest.get("assets") is not None:
+        assets = manifest.get("assets") or []
+        tables = sum(
+            1 for a in assets if isinstance(a, dict) and a.get("type") == "table"
+        )
+        stats = {"count": len(assets), "tables": tables}
+    with _peek_stats_lock:
+        if len(_peek_stats_cache) > 4096:
+            _peek_stats_cache.clear()
+        _peek_stats_cache[key] = (mtime, stats)
+    return stats
 
 
 def is_arxiv_paper_id(paper_id: str) -> bool:
@@ -682,8 +752,7 @@ def ensure_manifest(
 
     paper_id = str(target.get("paper_id", ""))
     cache_dir = assets_cache_dir(data_dir, date, paper_id)
-    lock_key = str(cache_dir)
-    with _lock_for(lock_key):
+    with _file_lock_for(cache_dir):
         existing = _load_manifest(cache_dir)
         if existing and _manifest_fresh(existing) and existing.get("assets") is not None:
             _rebuild_missing_thumbs(cache_dir, existing, target, send_mod)
@@ -761,8 +830,7 @@ def ensure_full_image(
     if full.is_file():
         return full, None
 
-    lock_key = f"{cache_dir}:full:{asset_id}"
-    with _lock_for(lock_key):
+    with _file_lock_for(cache_dir):
         if full.is_file():
             return full, None
         try:
@@ -823,8 +891,7 @@ def ensure_full_table_image(
     if not pdf_path or not pdf_path.is_file():
         return None, "PDF 下载失败"
 
-    lock_key = f"{cache_dir}:full:{asset_id}"
-    with _lock_for(lock_key):
+    with _file_lock_for(cache_dir):
         if full.is_file():
             return full, None
         try:
@@ -885,17 +952,19 @@ def manifest_cache_digest(manifest: dict) -> str:
     import hashlib
 
     fingerprint = {
+        "paper_id": str(manifest.get("paper_id") or ""),
         "manifest_version": int(manifest.get("manifest_version") or 0),
         "source": manifest.get("source") or "",
         "assets": [
             {
-                "id": a.get("id"),
-                "type": a.get("type"),
-                "source": a.get("source"),
-                "page": a.get("page"),
+                k: a.get(k)
+                for k in (
+                    "id", "type", "source", "page",
+                    "label", "caption", "image_url",
+                )
             }
             for a in (manifest.get("assets") or [])
         ],
     }
     canonical = json.dumps(fingerprint, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-    return hashlib.sha256(canonical.encode()).hexdigest()[:10]
+    return hashlib.sha256(canonical.encode()).hexdigest()[:12]

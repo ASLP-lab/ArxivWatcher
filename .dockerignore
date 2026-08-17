@@ -22,13 +22,8 @@ coverage.xml
 *.cover
 uv.lock
 
-# ── 运行时生成的数据（容器里用 volume 挂载，不进镜像）──
-data/*.json
-data/*.db
-data/*.db-shm
-data/*.db-wal
-data/.secret_key
-data/papers/
+# ── 运行时数据与密钥（只允许用 volume 挂载，绝不进镜像）──
+data/
 reports/
 report_*.html
 
@@ -42,6 +37,15 @@ static/_h/
 # ── 内部部署脚本（含密钥/LDAP/token，绝对不能进镜像）──
 start_web_internal.sh
 run_internal.sh
+llm_config.sh
+blacklist.txt
+highlight_authors.txt
+featured_authors.txt
+select_sites.txt
+pubkey_admin/
+
+# 本地配置统一通过只读 volume 挂载，构建上下文不包含任何实际配置
+config/
 
 # ── 仅本地存在的内网穿透工具 / 内部目录 ──
 frp_*/

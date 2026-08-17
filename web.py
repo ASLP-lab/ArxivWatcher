@@ -25,6 +25,7 @@
   STATIC_CACHE_SECONDS       /static/_h/* 哈希静态资源浏览器与 CDN 缓存秒数，默认 31536000（1 年）
   IMMUTABLE_CACHE_SECONDS    带 ETag 的不可变内容浏览器缓存秒数，默认 86400（1 天）
   IMMUTABLE_SMAXAGE_SECONDS  同上内容的 CDN（s-maxage）缓存秒数，默认 604800（7 天）
+  ARXIVWATCHER_CONFIG_DIR    本地配置目录，默认 ./config
 
 启动:
     python web.py
@@ -61,11 +62,13 @@ except ModuleNotFoundError:  # pragma: no cover
     except ModuleNotFoundError:
         tomllib = None  # type: ignore
 import time
+import uuid
 import zipfile
 from email.utils import format_datetime
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 from xml.sax.saxutils import escape as xml_escape
 
 try:
@@ -84,6 +87,8 @@ import aslp_feed
 import arxiv_version
 import ccf_catalog
 import content_digest
+import daily_digest
+import geo_stats
 import static_assets
 import auth
 import storage
@@ -134,6 +139,13 @@ REPORTS_DIR = ROOT / "reports"
 LOGS_DIR = ROOT / "logs"
 TEMPLATES_DIR = ROOT / "templates"
 STATIC_DIR = ROOT / "static"
+CONFIG_DIR = Path(os.environ.get("ARXIVWATCHER_CONFIG_DIR") or (ROOT / "config"))
+SELECT_SITES_PATH = (
+    CONFIG_DIR / "select_sites.txt"
+    if (CONFIG_DIR / "select_sites.txt").exists() or not (ROOT / "select_sites.txt").exists()
+    else ROOT / "select_sites.txt"
+)
+SELECT_MAX_SITES = 50
 
 BJ_TZ = ZoneInfo("Asia/Shanghai")
 ARXIV_NEW_URL = "https://arxiv.org/list/{category}/new"
@@ -166,6 +178,8 @@ app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
 
 
 def current_user() -> Optional[str]:
+    if not _login_cookie_allowed():
+        return None
     return session.get("username")
 
 
@@ -266,6 +280,38 @@ def load_index(date_str: str) -> Optional[dict]:
 def load_all_indices() -> list[dict]:
     """加载全部日期的 JSON 索引。"""
     return [d for d in (load_index(ds) for ds in list_all_dates()) if d]
+
+
+def _with_figure_stats(index: Optional[dict]) -> Optional[dict]:
+    """为列表内论文附加已缓存的图表统计（figure_count / figure_tables）。
+
+    只读磁盘 assets manifest，不触发 PDF 扫描；返回新 dict，不污染 load_index 缓存。
+    manifest 出现 / 更新会改变列表内容 -> digest 变化 -> hashed URL 自动换新，
+    与 CDN 内容寻址缓存策略一致。客户端据此预留图表区高度，避免加载时页面跳动。
+    """
+    if not index:
+        return index
+    date = str(index.get("date") or "")
+    if not date:
+        return index
+    out = dict(index)
+    for key in ("featured_papers", "papers", "extra_papers"):
+        items = index.get(key) or []
+        if not items:
+            continue
+        annotated = []
+        for p in items:
+            pid = str(p.get("paper_id") or "")
+            stats = paper_assets.peek_manifest_stats(DATA_DIR, date, pid) if pid else None
+            if stats is None:
+                annotated.append(p)
+                continue
+            pp = dict(p)
+            pp["figure_count"] = stats["count"]
+            pp["figure_tables"] = stats["tables"]
+            annotated.append(pp)
+        out[key] = annotated
+    return out
 
 
 def list_all_categories() -> list[str]:
@@ -369,7 +415,7 @@ def build_report_page_ris(*, date: str, report_url: str, source_page_url: str) -
     """将某一天报告网页导出为单条 RIS。"""
     date_ris = date.replace("-", "/")
     year = date[:4] if len(date) >= 4 else ""
-    title = _clean_ris_text(f"arXiv 每日精读报告 {date}")
+    title = _clean_ris_text(f"ArxivWatcher {date}")
     report_url = _clean_ris_text(report_url)
     source_page_url = _clean_ris_text(source_page_url)
     lines = [
@@ -393,10 +439,10 @@ def build_report_page_ris(*, date: str, report_url: str, source_page_url: str) -
 def build_rss_xml(*, base_url: str, papers: list[dict], category: str = "") -> str:
     """构造 RSS 2.0 XML。"""
     cat_hint = category.strip()
-    title = "arXiv 每日精读 RSS"
+    title = "ArxivWatcher RSS"
     desc = "聚合最近论文精读，支持 RSS 阅读器订阅。"
     if cat_hint:
-        title = f"arXiv 每日精读 RSS · {cat_hint}"
+        title = f"ArxivWatcher RSS · {cat_hint}"
         desc = f"分类 {cat_hint} 的近期论文精读。"
     pub_date = format_datetime(datetime.now(BJ_TZ))
     items: list[str] = []
@@ -420,7 +466,7 @@ def build_rss_xml(*, base_url: str, papers: list[dict], category: str = "") -> s
             f"      <guid isPermaLink=\"false\">{xml_escape(guid)}</guid>\n"
             f"      <pubDate>{format_datetime(_guess_pub_dt(p))}</pubDate>\n"
             f"      <description>{xml_escape(desc_body)}</description>\n"
-            f"      <source url=\"{xml_escape(report_link)}\">arXiv 每日精读</source>\n"
+            f"      <source url=\"{xml_escape(report_link)}\">ArxivWatcher</source>\n"
             "    </item>"
         )
     return (
@@ -437,6 +483,46 @@ def build_rss_xml(*, base_url: str, papers: list[dict], category: str = "") -> s
         "</rss>\n"
     )
 
+def build_digest_rss_xml(*, base_url: str, digests: list[dict]) -> str:
+    """Construct RSS 2.0 XML from daily digests."""
+    pub_date = format_datetime(datetime.now(BJ_TZ))
+    items: list[str] = []
+    for d in digests:
+        date_str = d.get("date", "")
+        text = d.get("text", "")
+        if not text:
+            continue
+        title = "ArxivWatcher 每日综述 - " + date_str
+        link = base_url.rstrip("/") + url_for("view_date", date=date_str)
+        guid = "digest-" + date_str
+        try:
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            item_pub = format_datetime(dt.replace(tzinfo=BJ_TZ, hour=9, minute=0, second=0))
+        except ValueError:
+            item_pub = pub_date
+        items.append(
+            "    <item>\n"
+            "      <title>" + xml_escape(title) + "</title>\n"
+            "      <link>" + xml_escape(link) + "</link>\n"
+            "      <guid isPermaLink=\"false\">" + xml_escape(guid) + "</guid>\n"
+            "      <pubDate>" + item_pub + "</pubDate>\n"
+            "      <description>" + xml_escape(text) + "</description>\n"
+            "    </item>"
+        )
+    return (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<rss version=\"2.0\">\n"
+        "  <channel>\n"
+        "    <title>ArxivWatcher 每日综述 RSS</title>\n"
+        "    <link>" + xml_escape(base_url.rstrip("/") + url_for("rss_page")) + "</link>\n"
+        "    <description>每日论文综述，按方向分组介绍当天重要论文。</description>\n"
+        "    <lastBuildDate>" + pub_date + "</lastBuildDate>\n"
+        "    <language>zh-cn</language>\n"
+        + chr(10).join(items) + "\n"
+        "  </channel>\n"
+        "</rss>\n"
+    )
+
 
 # ─────────────────────────────────────────────
 # 访问量统计（内存计数 + 文件持久化）
@@ -445,8 +531,58 @@ def build_rss_xml(*, base_url: str, papers: list[dict], category: str = "") -> s
 
 VISITOR_COOKIE_NAME = "arxiv_visitor_id"
 VISITOR_COOKIE_MAX_AGE = 60 * 60 * 24 * 400
+COOKIE_CONSENT_NAME = "arxiv_cookie_consent"
+COOKIE_CONSENT_MAX_AGE = 60 * 60 * 24 * 400
 _visits_store = _make_store("visits")
 _visits_lock = threading.Lock()
+_feature_usage_store = _make_store("feature_usage")
+_feature_usage_lock = threading.Lock()
+
+FEATURE_USAGE_LABELS = {
+    "papers": "网页查看所有论文",
+    "likes": "点赞",
+    "comments": "评论",
+    "search": "搜索",
+    "rss": "RSS",
+    "zotero": "Zotero",
+    "mcp": "MCP",
+}
+
+
+def record_feature_usage(feature: str, count: int = 1) -> None:
+    """按北京时间日期累计一次功能使用，支持 JSON / SQLite 存储后端。"""
+    if feature not in FEATURE_USAGE_LABELS or count <= 0:
+        return
+    date_str = datetime.now(BJ_TZ).strftime("%Y-%m-%d")
+    with _feature_usage_lock:
+        day = dict(_feature_usage_store.get(date_str) or {})
+        day[feature] = int(day.get(feature, 0) or 0) + int(count)
+        _feature_usage_store.put(date_str, day)
+
+
+def build_feature_usage_stats(days: int = 7) -> dict:
+    """返回含今天在内最近 days 个自然日的各功能使用总数。"""
+    days = max(1, min(int(days), 90))
+    today = datetime.now(BJ_TZ).date()
+    date_keys = [(today - timedelta(days=i)).isoformat() for i in range(days)]
+    with _feature_usage_lock:
+        snapshot = {
+            date_key: dict(_feature_usage_store.get(date_key) or {})
+            for date_key in date_keys
+        }
+    items = []
+    for key, label in FEATURE_USAGE_LABELS.items():
+        items.append({
+            "key": key,
+            "label": label,
+            "total": sum(int(snapshot[d].get(key, 0) or 0) for d in date_keys),
+        })
+    return {
+        "feature_usage_days": days,
+        "feature_usage_since": date_keys[-1],
+        "feature_usage_until": date_keys[0],
+        "feature_usage_items": items,
+    }
 
 
 def _normalize_day(day: dict) -> dict:
@@ -480,15 +616,43 @@ def _normalize_day(day: dict) -> dict:
 
 
 def _make_visitor_id() -> str:
-    return secrets.token_urlsafe(24)
+    return str(uuid.uuid4())
 
 
 def _valid_visitor_id(value: str) -> bool:
     return 16 <= len(value) <= 256
 
 
+def _cookie_consent() -> Optional[dict[str, bool]]:
+    """读取服务端签发的 Cookie 偏好；None 表示用户尚未选择。"""
+    raw = (request.cookies.get(COOKIE_CONSENT_NAME) or "").strip()
+    match = re.fullmatch(r"v1\.g([01])\.l([01])", raw)
+    if not match:
+        return None
+    return {"geo": match.group(1) == "1", "login": match.group(2) == "1"}
+
+
+def _login_cookie_allowed() -> bool:
+    consent = _cookie_consent()
+    return bool(consent and consent["login"])
+
+
 def _hash_visitor_id(visitor_id: str) -> str:
     return hashlib.sha256(visitor_id.encode("utf-8")).hexdigest()
+
+
+def _client_ip() -> str:
+    """提取真实客户端 IP：CDN 回源时通过 Ali-Cdn-Real-Ip 传递。"""
+    ip = (request.headers.get("Ali-Cdn-Real-Ip") or "").strip()
+    if not ip:
+        ip = (request.headers.get("X-Real-IP") or "").strip()
+    if not ip:
+        xff = (request.headers.get("X-Forwarded-For") or "").strip()
+        if xff:
+            ip = xff.split(",")[0].strip()
+    if not ip:
+        ip = (request.remote_addr or "").strip()
+    return ip
 
 
 def _valid_tab_id(value: str) -> bool:
@@ -497,6 +661,63 @@ def _valid_tab_id(value: str) -> bool:
 
 def _hash_tab_key(visitor_id: str, tab_id: str) -> str:
     return hashlib.sha256(f"{visitor_id}:{tab_id}".encode("utf-8")).hexdigest()
+
+
+def _star_prompt_identity() -> str:
+    """Return a stable identity key for star prompt: username if logged in, else visitor cookie hash."""
+    username = current_user()
+    if username:
+        return f"user:{username}"
+    visitor_id = (request.cookies.get(VISITOR_COOKIE_NAME) or "").strip()
+    if _valid_visitor_id(visitor_id):
+        return f"anon:{_hash_visitor_id(visitor_id)}"
+    return ""
+
+
+def _star_prompt_should_show(identity: str) -> bool:
+    """Check if star prompt should be shown for this identity (fresh, cross-worker read)."""
+    if not identity:
+        return False
+    try:
+        row = _star_prompt_db().execute(
+            f'SELECT visit_count, never FROM "{_STAR_PROMPT_TABLE}" WHERE identity = ?',
+            (identity,),
+        ).fetchone()
+    except Exception as e:
+        log.warning(f"Star prompt 状态读取失败: {e}")
+        return False
+    if not row:
+        return False
+    return (not row[1]) and int(row[0]) >= STAR_PROMPT_THRESHOLD
+
+
+def _star_prompt_increment(identity: str) -> None:
+    """Atomically increment the cumulative visit count (single statement, cross-worker safe)."""
+    if not identity:
+        return
+    _star_prompt_db().execute(
+        f'INSERT INTO "{_STAR_PROMPT_TABLE}" (identity, visit_count, never) VALUES (?, 1, 0) '
+        "ON CONFLICT(identity) DO UPDATE SET visit_count = visit_count + 1",
+        (identity,),
+    )
+
+
+def _star_prompt_dismiss(identity: str, action: str) -> None:
+    """Record dismissal: 'remind' resets the count, 'never' suppresses forever."""
+    if not identity:
+        return
+    if action == STAR_PROMPT_KEY_NEVER:
+        _star_prompt_db().execute(
+            f'INSERT INTO "{_STAR_PROMPT_TABLE}" (identity, visit_count, never) VALUES (?, 0, 1) '
+            "ON CONFLICT(identity) DO UPDATE SET never = 1",
+            (identity,),
+        )
+    elif action == STAR_PROMPT_KEY_REMIND:
+        _star_prompt_db().execute(
+            f'INSERT INTO "{_STAR_PROMPT_TABLE}" (identity, visit_count, never) VALUES (?, 0, 0) '
+            "ON CONFLICT(identity) DO UPDATE SET visit_count = 0",
+            (identity,),
+        )
 
 
 def record_tab_visit(visitor_id: str, tab_id: str) -> bool:
@@ -628,6 +849,55 @@ _reading_list_lock = threading.Lock()
 
 _arxiv_versions_store = _make_store("arxiv_versions")
 _arxiv_version_cache = arxiv_version.ArxivVersionCache(_arxiv_versions_store)
+
+# Star prompt: track per-user visit count and dismissal state.
+# 不用 Store（进程内缓存，48 个 gunicorn worker 各自记账会互相不可见），
+# 而是用独立的 SQLite 表 + 原子 UPSERT，保证跨 worker 一致。
+STAR_PROMPT_THRESHOLD = 3
+STAR_PROMPT_KEY_REMIND = "remind"      # next time
+STAR_PROMPT_KEY_NEVER = "never"        # never remind
+_STAR_PROMPT_TABLE = "star_prompt_state"
+_star_prompt_db_lock = threading.Lock()
+_star_prompt_db_inited = False
+
+
+def _migrate_star_prompt_legacy(conn) -> None:
+    """把旧版 Store（star_prompt.json / sqlite k-v 表）里的计数迁到新表，尽力而为。"""
+    try:
+        legacy = _make_store("star_prompt").all()
+    except Exception:
+        return
+    try:
+        for identity, data in legacy.items():
+            if not isinstance(data, dict):
+                continue
+            cnt = int(data.get("visit_count") or 0)
+            never = 1 if data.get(STAR_PROMPT_KEY_NEVER) else 0
+            conn.execute(
+                f'INSERT OR IGNORE INTO "{_STAR_PROMPT_TABLE}" (identity, visit_count, never) '
+                "VALUES (?, ?, ?)",
+                (identity, cnt, never),
+            )
+    except Exception as e:
+        log.warning(f"star_prompt 旧数据迁移失败（已忽略）: {e}")
+
+
+def _star_prompt_db():
+    global _star_prompt_db_inited
+    conn = storage.shared_sqlite_conn(SQLITE_PATH)
+    if not _star_prompt_db_inited:
+        with _star_prompt_db_lock:
+            if not _star_prompt_db_inited:
+                with conn:
+                    conn.execute(
+                        f'CREATE TABLE IF NOT EXISTS "{_STAR_PROMPT_TABLE}" ('
+                        "identity TEXT PRIMARY KEY, "
+                        "visit_count INTEGER NOT NULL DEFAULT 0, "
+                        "never INTEGER NOT NULL DEFAULT 0)"
+                    )
+                    _migrate_star_prompt_legacy(conn)
+                _star_prompt_db_inited = True
+    return conn
 
 
 def _get_interactions() -> dict:
@@ -841,7 +1111,12 @@ def search_papers(
     for index in load_all_indices():
         if date and index["date"] != date:
             continue
-        for p in index["papers"]:
+        all_papers = [
+            *(index.get("featured_papers") or []),
+            *(index.get("papers") or []),
+            *(index.get("extra_papers") or []),
+        ]
+        for p in all_papers:
             title = (p.get("title") or "").lower()
             authors = " | ".join(p.get("authors", [])).lower()
             subjects = (p.get("subjects") or "").lower()
@@ -981,7 +1256,10 @@ def inject_globals():
         "allow_register": auth.registration_enabled(),
         "ldap_enabled": auth.ldap_enabled(),
         "icp_beian": icp_beian,
+        "amap_js_key": os.environ.get("AMAP_JS_KEY", "").strip(),
+        "amap_js_security_code": os.environ.get("AMAP_JS_SECURITY_CODE", "").strip(),
         "app_version": APP_VERSION,
+        "cookie_consent": _cookie_consent(),
     }
 
 
@@ -1012,6 +1290,48 @@ def _compress_bytes(data: bytes, encoding: str, best: bool) -> bytes:
 
 
 @app.after_request
+def _record_feature_usage(response: Response) -> Response:
+    """成功请求按业务入口计数；MCP 工具调用在 mcp_server 内单独记录。"""
+    if response.status_code >= 400:
+        return response
+
+    endpoint = request.endpoint or ""
+    feature = None
+    if endpoint == "view_date":
+        feature = "papers"
+    elif endpoint == "api_like":
+        feature = "likes"
+    elif endpoint == "api_comment_post":
+        feature = "comments"
+    elif endpoint in ("search", "api_search"):
+        if any((request.args.get(name) or "").strip() for name in ("q", "cat", "date")):
+            feature = "search"
+    elif endpoint in ("rss_page", "rss_feed"):
+        feature = "rss"
+    elif endpoint == "zotero_plugin_page":
+        feature = "zotero"
+    elif endpoint in (
+        "api_dates",
+        "download_html",
+        "zotero_ris_date",
+        "zotero_ris_latest",
+        "zotero_ris_today",
+        "zotero_plugin_updates",
+        "zotero_plugin_xpi",
+    ) and "zotero" in (request.user_agent.string or "").lower():
+        feature = "zotero"
+    elif endpoint == "mcp_page":
+        feature = "mcp"
+
+    if feature:
+        try:
+            record_feature_usage(feature)
+        except Exception as e:
+            log.warning("功能使用统计写入失败 (%s): %s", feature, e)
+    return response
+
+
+@app.after_request
 def _compress_response(response: Response) -> Response:
     """对较大的文本类响应做 br/gzip 压缩。
     不可变内容（带强 ETag + public 缓存）只压一次并按 ETag 缓存压缩字节、且用最高压缩比。
@@ -1037,7 +1357,7 @@ def _compress_response(response: Response) -> Response:
 
         compressed = None
         if cacheable:
-            key = (etag, encoding)
+            key = (etag, encoding, request.path)
             with _compress_cache_lock:
                 compressed = _compress_cache.get(key)
             if compressed is None:
@@ -1138,8 +1458,44 @@ def _set_cache_headers(response: Response) -> Response:
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,32}$")
 
 
+@app.route("/api/cookie-consent", methods=["POST"])
+def api_cookie_consent():
+    """保存可选 Cookie 偏好，并确保必要的匿名 UUID 已签发。"""
+    payload = request.get_json(silent=True) or {}
+    geo_allowed = payload.get("geo") is True
+    login_allowed = payload.get("login") is True
+    value = f"v1.g{int(geo_allowed)}.l{int(login_allowed)}"
+
+    if not login_allowed:
+        session.clear()
+
+    resp = jsonify({
+        "ok": True,
+        "consent": {"geo": geo_allowed, "login": login_allowed},
+    })
+    resp.set_cookie(
+        COOKIE_CONSENT_NAME,
+        value,
+        max_age=COOKIE_CONSENT_MAX_AGE,
+        httponly=True,
+        samesite="Lax",
+    )
+    visitor_id = (request.cookies.get(VISITOR_COOKIE_NAME) or "").strip()
+    if not _valid_visitor_id(visitor_id):
+        resp.set_cookie(
+            VISITOR_COOKIE_NAME,
+            _make_visitor_id(),
+            max_age=VISITOR_COOKIE_MAX_AGE,
+            httponly=True,
+            samesite="Lax",
+        )
+    return resp
+
+
 @app.route("/auth/register", methods=["POST"])
 def auth_register():
+    if not _login_cookie_allowed():
+        return jsonify({"ok": False, "msg": "请先在 Cookie 设置中启用“登录信息 Cookie”"}), 403
     if not auth.registration_enabled():
         return jsonify({"ok": False, "msg": "本站已关闭注册"}), 403
     payload = request.get_json(silent=True) or {}
@@ -1165,6 +1521,8 @@ def auth_register():
 
 @app.route("/auth/login", methods=["POST"])
 def auth_login():
+    if not _login_cookie_allowed():
+        return jsonify({"ok": False, "msg": "请先在 Cookie 设置中启用“登录信息 Cookie”"}), 403
     payload = request.get_json(silent=True) or {}
     username = str(payload.get("username") or "").strip()
     password = str(payload.get("password") or "")
@@ -1197,6 +1555,9 @@ def auth_me():
 # ─────────────────────────────────────────────
 
 def _find_paper(index: dict, paper_id: str) -> Optional[dict]:
+    for p in index.get("featured_papers") or []:
+        if str(p.get("paper_id")) == str(paper_id):
+            return p
     for p in index.get("papers", []):
         if str(p.get("paper_id")) == str(paper_id):
             return p
@@ -1278,7 +1639,7 @@ def api_papers_digest(date: str):
     """返回某日论文列表的内容哈希（短缓存，供收藏页等动态拼 hashed URL）。"""
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
         abort(404)
-    index = load_index(date)
+    index = _with_figure_stats(load_index(date))
     if not index:
         abort(404)
     digest = content_digest.papers_list_digest(index)
@@ -1295,7 +1656,7 @@ def api_single_paper_hashed(digest: str, date: str, paper_id: str):
     """内容寻址：单篇论文元数据（分享页用，可长期 CDN 缓存）。"""
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
         abort(404)
-    index = load_index(date)
+    index = _with_figure_stats(load_index(date))
     if not index:
         abort(404)
     target = _find_paper(index, paper_id)
@@ -1314,7 +1675,7 @@ def api_papers_hashed(digest: str, date: str):
     """内容寻址：某日论文列表（不含精读正文）。"""
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
         abort(404)
-    index = load_index(date)
+    index = _with_figure_stats(load_index(date))
     if not index:
         abort(404)
     expected = content_digest.papers_list_digest(index)
@@ -1346,7 +1707,7 @@ def api_papers(date: str):
     """兼容旧客户端；请改用 /api/h/<digest>/papers/<date>。"""
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
         abort(404)
-    index = load_index(date)
+    index = _with_figure_stats(load_index(date))
     if not index:
         abort(404)
     return _apply_no_cdn_cache(jsonify(content_digest.build_papers_list_payload(index)))
@@ -2250,6 +2611,50 @@ def api_aslp_feed():
     return _apply_no_cdn_cache(resp)
 
 
+def _load_select_sites() -> list[dict[str, str]]:
+    """读取站点择优配置；仅接受 HTTP(S)，一行支持 ``名称 | URL`` 或纯 URL。"""
+    try:
+        lines = SELECT_SITES_PATH.read_text(encoding="utf-8").splitlines()
+    except (FileNotFoundError, OSError):
+        return []
+
+    sites: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "|" in line:
+            name, url = (part.strip() for part in line.split("|", 1))
+        else:
+            name, url = "", line
+        parsed = urlsplit(url)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+            log.warning("忽略无效测速站点: %s", raw_line)
+            continue
+        if parsed.username or parsed.password or url in seen:
+            log.warning("忽略重复或包含认证信息的测速站点: %s", raw_line)
+            continue
+        seen.add(url)
+        sites.append({"name": name or parsed.netloc, "url": url})
+        if len(sites) >= SELECT_MAX_SITES:
+            break
+    return sites
+
+
+@app.route("/health")
+def health():
+    """供负载均衡器与站点择优使用的极简存活探针。"""
+    response = Response(status=204)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.route("/select")
+def select_page():
+    return render_template("select.html", sites=_load_select_sites())
+
+
 @app.route("/")
 def index():
     dates = list_all_dates()
@@ -2286,6 +2691,7 @@ def view_date(date: str):
         if i > 0:
             next_date = dates[i - 1]
 
+    index = _with_figure_stats(index)
     papers_digest = content_digest.papers_list_digest(index) if index else None
 
     return render_template(
@@ -2307,7 +2713,7 @@ def view_paper_share(date: str, paper_id: str):
         abort(404)
     if date not in list_all_dates():
         abort(404)
-    index = load_index(date)
+    index = _with_figure_stats(load_index(date))
     if not index:
         abort(404)
     target = _find_paper(index, paper_id)
@@ -2625,13 +3031,21 @@ def rss_page():
 
 @app.route("/rss/feed.xml")
 def rss_feed():
-    cat = request.args.get("cat", "").strip()
     try:
-        limit = max(1, min(int(request.args.get("limit", "80")), 200))
+        limit = max(1, min(int(request.args.get("limit", "30")), 90))
     except ValueError:
-        limit = 80
-    papers = collect_recent_papers(category=cat, limit=limit)
-    xml_text = build_rss_xml(base_url=request.host_url.rstrip("/"), papers=papers, category=cat)
+        limit = 30
+    digests = daily_digest.get_recent_digests(limit=limit)
+    if digests:
+        xml_text = build_digest_rss_xml(
+            base_url=request.host_url.rstrip("/"), digests=digests,
+        )
+    else:
+        cat = request.args.get("cat", "").strip()
+        papers = collect_recent_papers(category=cat, limit=80)
+        xml_text = build_rss_xml(
+            base_url=request.host_url.rstrip("/"), papers=papers, category=cat,
+        )
     return Response(xml_text, mimetype="application/rss+xml; charset=utf-8")
 
 
@@ -2657,6 +3071,7 @@ def stats():
     """访问量看板：今日 24h 分布 + 最近 30 天历史；含 LLM Token 消耗。"""
     ctx = build_visit_stats()
     ctx.update(llm_usage.build_stats())
+    ctx.update(build_feature_usage_stats(days=7))
     return render_template("stats.html", **ctx)
 
 
@@ -2736,7 +3151,36 @@ def api_tab_visit():
         log.warning(f"记录 tab 访问失败: {e}")
         return {"ok": False, "msg": "failed to record visit"}, 500
 
-    response = {"ok": True, "counted": counted}
+    # 访客来源地理统计：只对计入访问量的访问（每 tab 每天一次，且由 JS 触发）记录
+    if counted:
+        try:
+            consent = _cookie_consent()
+            if consent and consent["geo"]:
+                client_ip = _client_ip()
+                result = geo_stats.record_visit(SQLITE_PATH, client_ip)
+                if result != "ok":
+                    masked = re.sub(r"(\d+)\.\d+\.\d+$", r"\1.*.*", client_ip)
+                    log.info(f"访客来源未记录: {result} (ip={masked})")
+            else:
+                result = geo_stats.record_unknown_visit(SQLITE_PATH)
+                if result != "ok":
+                    log.info(f"未知访客来源未记录: {result}")
+        except Exception as e:
+            log.warning(f"访客来源记录失败: {e}")
+
+    # Star prompt: increment visit count and check threshold.
+    # 直接用本次请求已验证/新建的 visitor_id（首次访问时 cookie 尚未随请求带来，
+    # 走 _star_prompt_identity() 会拿到空 identity 导致首访不计数）。
+    username = current_user()
+    star_identity = f"user:{username}" if username else f"anon:{_hash_visitor_id(visitor_id)}"
+    if counted and star_identity:
+        try:
+            _star_prompt_increment(star_identity)
+        except Exception as e:
+            log.warning(f"Star prompt 计数失败: {e}")
+    show_star_prompt = _star_prompt_should_show(star_identity) if star_identity else False
+
+    response = {"ok": True, "counted": counted, "show_star_prompt": show_star_prompt}
     if should_set_cookie:
         resp = app.response_class(
             response=json.dumps(response, ensure_ascii=False),
@@ -2754,12 +3198,53 @@ def api_tab_visit():
     return response
 
 
+@app.route("/api/geo-stats")
+def api_geo_stats():
+    """最近 7 天访客来源（国家 + 城市），供首页底部地图展示。"""
+    try:
+        data = geo_stats.get_stats(SQLITE_PATH, days=7)
+    except Exception as e:
+        log.warning(f"访客来源统计读取失败: {e}")
+        data = {"days": 7, "total": 0, "daily": [], "countries": [], "cities": []}
+    data["debug"] = geo_stats.status()
+    resp = app.response_class(
+        response=json.dumps(data, ensure_ascii=False),
+        status=200,
+        mimetype="application/json",
+    )
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/api/star-prompt", methods=["POST"])
+def api_star_prompt():
+    """Record star prompt dismissal: 'remind' or 'never'."""
+    payload = request.get_json(silent=True) or {}
+    action = str(payload.get("action") or "").strip()
+    if action not in (STAR_PROMPT_KEY_REMIND, STAR_PROMPT_KEY_NEVER):
+        return {"ok": False, "msg": "invalid action"}, 400
+
+    identity = _star_prompt_identity()
+    if not identity:
+        return {"ok": False, "msg": "cannot identify user"}, 400
+
+    try:
+        _star_prompt_dismiss(identity, action)
+    except Exception as e:
+        log.warning(f"Star prompt dismiss 失败: {e}")
+        return {"ok": False, "msg": "failed"}, 500
+
+    return {"ok": True}
+
+
 @app.route("/admin/stats")
 def admin_stats():
     auth_error = _admin_auth_error()
     if auth_error:
         return auth_error
-    return {"ok": True, "stats": build_visit_stats(), "visits": get_visits_snapshot()}
+    stats_data = build_visit_stats()
+    stats_data.update(build_feature_usage_stats(days=7))
+    return {"ok": True, "stats": stats_data, "visits": get_visits_snapshot()}
 
 
 # ─────────────────────────────────────────────
@@ -3315,10 +3800,12 @@ def _parse_shell_exports(path: Path, *, prefix: str = "") -> dict[str, str]:
 
 
 def _llm_env() -> dict[str, str]:
-    """合并进程环境变量与 llm_config.sh（进程 env 优先）。"""
+    """合并进程环境变量与 config/llm_config.sh（进程 env 优先）。"""
     env = dict(os.environ)
-    for name in ("llm_config.sh", "llm_config.local.sh"):
-        for key, val in _parse_shell_exports(ROOT / name, prefix="LLM_").items():
+    config_paths = (CONFIG_DIR / "llm_config.sh", CONFIG_DIR / "llm_config.local.sh")
+    legacy_paths = (ROOT / "llm_config.sh", ROOT / "llm_config.local.sh")
+    for path in (*config_paths, *legacy_paths):
+        for key, val in _parse_shell_exports(path, prefix="LLM_").items():
             if not str(env.get(key, "")).strip():
                 env[key] = val
     return env
@@ -3330,10 +3817,10 @@ def _build_llm_config_from_env():
     env = _llm_env()
     api_key = str(env.get("LLM_API_KEY", "")).strip()
     if not api_key:
-        cfg = ROOT / "llm_config.sh"
+        cfg = CONFIG_DIR / "llm_config.sh"
         hint = (
             f"未找到 LLM_API_KEY。请在环境变量中设置，或创建 {cfg.name} "
-            f"（可参考 llm_config.example.sh），然后重启 web 服务。"
+            f"（可参考 config/llm_config.example.sh），然后重启 web 服务。"
         )
         raise ValueError(hint)
     enable_thinking = str(env.get("LLM_ENABLE_THINKING", "")).strip().lower() in ("1", "true", "yes", "on")
@@ -3707,10 +4194,11 @@ def api_daily_status():
 
     if has_data:
         papers_list = index.get("papers") or []
+        featured_list = index.get("featured_papers") or []
         extra_list = index.get("extra_papers") or []
-        paper_count = len(papers_list)
+        paper_count = len(featured_list) + len(papers_list)
         extra_count = len(extra_list)
-        for p in papers_list + extra_list:
+        for p in featured_list + papers_list + extra_list:
             analysis = (p.get("analysis") or "").strip()
             if not analysis or analysis.startswith("[LLM") or analysis.startswith("[PDF"):
                 analysis_failed += 1

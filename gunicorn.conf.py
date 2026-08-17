@@ -6,7 +6,8 @@ import os
 
 bind = f"{os.environ.get('WEB_HOST', '127.0.0.1')}:{os.environ.get('WEB_PORT', '8080')}"
 workers = int(os.environ.get("WEB_WORKERS", "48"))
-worker_class = "sync"
+worker_class = "gthread"
+threads = int(os.environ.get("WEB_THREADS", "4"))
 timeout = int(os.environ.get("WEB_TIMEOUT", "120"))
 graceful_timeout = int(os.environ.get("WEB_GRACEFUL_TIMEOUT", "30"))
 keepalive = int(os.environ.get("WEB_KEEPALIVE", "5"))

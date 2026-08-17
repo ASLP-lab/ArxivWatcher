@@ -38,6 +38,17 @@ run_internal.sh
 llm_config.sh
 blacklist.txt
 highlight_authors.txt
+featured_authors.txt
+select_sites.txt
+
+# Consolidated local configuration (examples remain public)
+config/*.txt
+!config/*.example.txt
+config/llm_config.sh
+config/llm_config.local.sh
+
+# Standalone internal LDAP/SSH administration service and deployment topology
+pubkey_admin/
 
 # Local / internal only (do not publish)
 .git_back/

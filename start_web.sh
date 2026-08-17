@@ -10,6 +10,12 @@ fi
 
 export TZ="${TZ:-Asia/Shanghai}"
 
+CONFIG_DIR="${ARXIVWATCHER_CONFIG_DIR:-config}"
+if [ -f "${CONFIG_DIR}/llm_config.sh" ]; then
+  # shellcheck source=/dev/null
+  source "${CONFIG_DIR}/llm_config.sh"
+fi
+
 export WEB_HOST="${WEB_HOST:-127.0.0.1}"
 export WEB_PORT="${WEB_PORT:-8091}"
 export WEB_WORKERS="${WEB_WORKERS:-48}"

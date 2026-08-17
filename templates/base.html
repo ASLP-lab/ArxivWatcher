@@ -4,7 +4,11 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="color-scheme" content="light dark">
-<title>{% block title %}arXiv 每日论文精读{% endblock %}</title>
+<link rel="icon" type="image/x-icon" href="{{ static_asset('logos/favicon.ico') }}">
+<link rel="icon" type="image/png" sizes="32x32" href="{{ static_asset('logos/favicon-32.png') }}">
+<link rel="icon" type="image/png" sizes="16x16" href="{{ static_asset('logos/favicon-16.png') }}">
+<link rel="apple-touch-icon" sizes="180x180" href="{{ static_asset('logos/apple-touch-icon.png') }}">
+<title>{% block title %}ArxivWatcher{% endblock %}</title>
 <script>
 /* 防闪烁：在 CSS 渲染前根据 localStorage 决定主题，避免深色刷新闪白。
    localStorage['theme'] = 'light' | 'dark' | 未设(跟随系统) */
@@ -24,8 +28,9 @@
 <header class="site-header">
   <div class="site-header-inner">
     <a class="brand" href="{{ url_for('index') }}">
-      <span class="brand-emoji">📚</span>
-      <span class="brand-text">arXiv 每日精读</span>
+      <img class="brand-logo" src="{{ static_asset('logos/logo-nav.png') }}" alt="ArxivWatcher" width="28" height="28">
+      <span class="brand-text">ArxivWatcher</span>
+      <span class="brand-version">v{{ app_version }}</span>
     </a>
     <nav class="site-nav">
       <a href="{{ url_for('index') }}" class="{% if request.endpoint in ['index', 'today', 'view_date'] %}active{% endif %}">今日</a>
@@ -35,6 +40,7 @@
       <a href="{{ url_for('zotero_plugin_page') }}" class="{% if request.endpoint == 'zotero_plugin_page' %}active{% endif %}">Zotero</a>
       <a href="{{ url_for('mcp_page') }}" class="{% if request.endpoint == 'mcp_page' %}active{% endif %}">MCP</a>
       <a href="{{ url_for('stats') }}" class="{% if request.endpoint == 'stats' %}active{% endif %}">统计</a>
+      <a href="{{ url_for('select_page') }}" class="{% if request.endpoint == 'select_page' %}active{% endif %}">择优</a>
     </nav>
     <button class="theme-toggle" id="theme-toggle" type="button" title="切换深色 / 浅色 / 跟随系统" aria-label="切换主题">
       <span class="theme-icon-moon">🌙</span><span class="theme-icon-sun">☀️</span>
@@ -100,6 +106,7 @@
         <a href="https://github.com/ASLP-lab/ArxivWatcher" target="_blank" rel="noopener noreferrer">ArxivWatcher</a>
         <span class="footer-version">v{{ app_version }}</span>
       </span>
+      <button class="footer-cookie-settings" type="button" onclick="openCookieSettings()">Cookie 设置</button>
       {% if icp_beian %}
       <a class="footer-beian" href="https://beian.miit.gov.cn/" target="_blank" rel="noopener noreferrer">{{ icp_beian }}</a>
       {% endif %}
@@ -115,6 +122,7 @@
       <button class="modal-tab" data-tab="register">注册</button>
     </div>
     <div id="tab-login" class="modal-tab-content">
+      <p class="auth-cookie-hint">登录需要启用“登录信息 Cookie”。若未勾选，本站无法保存登录状态。可在页面底部的 Cookie 设置中修改。</p>
       {% if ldap_enabled %}
       <p class="auth-ldap-hint">支持使用实验室服务器账号密码登录</p>
       {% endif %}
@@ -142,9 +150,85 @@
   </div>
 </div>
 
+<!-- Cookie consent: no dismiss action until the visitor makes a choice. -->
+<section id="cookie-banner" class="cookie-banner" role="dialog" aria-modal="true"
+         aria-labelledby="cookie-banner-title"
+         style="display:{{ 'none' if cookie_consent else 'flex' }}">
+  <div class="cookie-banner-copy">
+    <h2 id="cookie-banner-title">我们使用 Cookie</h2>
+    <p>必要的 UUID Token 始终启用，用于匿名识别和点赞。你可以选择是否允许 IP 归属地统计与登录信息 Cookie。</p>
+  </div>
+  <div class="cookie-banner-actions">
+    <button type="button" class="cookie-btn cookie-btn-secondary" onclick="openCookieSettings()">Cookie 设置</button>
+    <button type="button" class="cookie-btn cookie-btn-primary" onclick="allowAllCookies()">允许全部</button>
+  </div>
+</section>
+
+<div id="cookie-settings-modal" class="modal-overlay cookie-settings-overlay" style="display:none"
+     role="dialog" aria-modal="true" aria-labelledby="cookie-settings-title">
+  <div class="modal-card cookie-settings-card">
+    <h2 id="cookie-settings-title">Cookie 设置</h2>
+    <p class="cookie-settings-intro">必要 Cookie 无法关闭。可选项可随时在页面底部重新设置。</p>
+    <label class="cookie-option cookie-option-required">
+      <span>
+        <strong>UUID Token</strong>
+        <small>用于匿名识别、点赞和防止重复计数。</small>
+      </span>
+      <input type="checkbox" checked disabled>
+    </label>
+    <label class="cookie-option">
+      <span>
+        <strong>IP 归属地信息</strong>
+        <small>用于生成访客来源统计；关闭后不读取归属地，并显示为“未知”。</small>
+      </span>
+      <input id="cookie-geo" type="checkbox">
+    </label>
+    <label class="cookie-option">
+      <span>
+        <strong>登录信息 Cookie</strong>
+        <small>用于保存登录状态；关闭后无法登录或注册。</small>
+      </span>
+      <input id="cookie-login" type="checkbox">
+    </label>
+    <div id="cookie-settings-error" class="modal-error"></div>
+    <div class="cookie-settings-actions">
+      <button type="button" class="cookie-btn cookie-btn-primary" onclick="saveCookieSettings()">保存设置</button>
+    </div>
+  </div>
+</div>
+
+<!-- Star Prompt Modal -->
+<div id="star-prompt-modal" class="modal-overlay" style="display:none">
+  <div class="modal-card star-prompt-card">
+    <div class="star-prompt-icon">
+      <svg viewBox="0 0 16 16" width="48" height="48" fill="currentColor" aria-hidden="true">
+        <path d="M8 .25a.75.75 0 0 1 .673.418l1.882 3.815 4.21.612a.75.75 0 0 1 .416 1.279l-3.046 2.97.719 4.192a.75.75 0 0 1-1.088.791L8 12.347l-3.766 1.98a.75.75 0 0 1-1.088-.79l.72-4.194L.818 6.374a.75.75 0 0 1 .416-1.28l4.21-.611L7.327.668A.75.75 0 0 1 8 .25z"/>
+      </svg>
+    </div>
+    <h3 class="star-prompt-title">支持 ArxivWatcher</h3>
+    <p class="star-prompt-desc">如果 ArxivWatcher 对你有帮助，欢迎在 GitHub 给我们点个 Star，这是对我们持续维护的最大鼓励。</p>
+    <div class="star-prompt-actions">
+      <a class="star-prompt-btn star-prompt-btn-primary" href="https://github.com/ASLP-lab/ArxivWatcher" target="_blank" rel="noopener noreferrer" onclick="dismissStarPrompt('remind')">
+        <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M8 .25a.75.75 0 0 1 .673.418l1.882 3.815 4.21.612a.75.75 0 0 1 .416 1.279l-3.046 2.97.719 4.192a.75.75 0 0 1-1.088.791L8 12.347l-3.766 1.98a.75.75 0 0 1-1.088-.79l.72-4.194L.818 6.374a.75.75 0 0 1 .416-1.28l4.21-.611L7.327.668A.75.75 0 0 1 8 .25z"/></svg>
+        去 Star
+      </a>
+      <button class="star-prompt-btn star-prompt-btn-secondary" onclick="dismissStarPrompt('remind')">下次一定</button>
+      <button class="star-prompt-btn star-prompt-btn-ghost" onclick="dismissStarPrompt('never')">不再提醒</button>
+    </div>
+  </div>
+</div>
+
 <script>
 /* Auth modal */
-function showAuthModal(){document.getElementById('auth-modal').style.display='flex'}
+function showAuthModal(){
+  if (!window.ArxivCookieConsent || !window.ArxivCookieConsent.login) {
+    openCookieSettings();
+    var err=document.getElementById('cookie-settings-error');
+    if(err)err.textContent='请勾选“登录信息 Cookie”并保存后再登录。';
+    return;
+  }
+  document.getElementById('auth-modal').style.display='flex'
+}
 function hideAuthModal(){document.getElementById('auth-modal').style.display='none'}
 document.querySelectorAll('.modal-tab').forEach(function(tab){
   tab.addEventListener('click',function(){
@@ -216,7 +300,51 @@ document.getElementById('auth-modal').addEventListener('click',function(e){if(e.
 </script>
 
 <script>
-(function () {
+window.ArxivCookieConsent = {{ cookie_consent | tojson }};
+
+function openCookieSettings() {
+  /* 首次打开设置时默认全部允许；已有选择时回显用户上次保存的状态。 */
+  var consent = window.ArxivCookieConsent || {geo:true, login:true};
+  document.getElementById('cookie-geo').checked = !!consent.geo;
+  document.getElementById('cookie-login').checked = !!consent.login;
+  document.getElementById('cookie-settings-error').textContent = '';
+  document.getElementById('cookie-settings-modal').style.display = 'flex';
+}
+function closeCookieSettings() {
+  document.getElementById('cookie-settings-modal').style.display = 'none';
+}
+function persistCookieSettings(geo, login) {
+  var err = document.getElementById('cookie-settings-error');
+  err.textContent = '';
+  return fetch("{{ url_for('api_cookie_consent') }}", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({geo: !!geo, login: !!login})
+  }).then(function(resp) {
+    if (!resp.ok) throw new Error('保存失败');
+    return resp.json();
+  }).then(function(data) {
+    window.ArxivCookieConsent = data.consent;
+    document.getElementById('cookie-banner').style.display = 'none';
+    closeCookieSettings();
+    recordTabVisit();
+    if (!data.consent.login && {{ 'true' if current_user else 'false' }}) location.reload();
+  }).catch(function() {
+    err.textContent = '设置暂时无法保存，请重试。';
+  });
+}
+function saveCookieSettings() {
+  return persistCookieSettings(
+    document.getElementById('cookie-geo').checked,
+    document.getElementById('cookie-login').checked
+  );
+}
+function allowAllCookies() {
+  return persistCookieSettings(true, true);
+}
+
+function recordTabVisit() {
   var today = "{{ now_bj.strftime('%Y-%m-%d') }}";
   var recordedKey = "arxiv_tab_visit_recorded_" + today;
   if (window.sessionStorage.getItem(recordedKey) === "1") {
@@ -239,15 +367,50 @@ document.getElementById('auth-modal').addEventListener('click',function(e){if(e.
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ tab_id: tabId })
   })
-    .then(function (resp) {
-      if (resp.ok) {
+    .then(function (resp) { return resp.json(); })
+    .then(function (data) {
+      if (data.ok) {
         window.sessionStorage.setItem(recordedKey, "1");
+        window.dispatchEvent(new CustomEvent("arxiv:tab-visit-recorded", {
+          detail: { counted: !!data.counted }
+        }));
+      }
+      if (data.show_star_prompt && !window.sessionStorage.getItem("star_prompt_shown")) {
+        window.sessionStorage.setItem("star_prompt_shown", "1");
+        showStarPrompt();
       }
     })
     .catch(function () {
       // ignore network error
     });
+}
+
+(function () {
+  if (window.ArxivCookieConsent) {
+    recordTabVisit();
+  } else {
+    document.getElementById('cookie-banner').style.display = 'flex';
+  }
 })();
+
+/* Star prompt */
+function showStarPrompt() {
+  var modal = document.getElementById('star-prompt-modal');
+  if (modal) modal.style.display = 'flex';
+}
+function dismissStarPrompt(action) {
+  var modal = document.getElementById('star-prompt-modal');
+  if (modal) modal.style.display = 'none';
+  fetch("{{ url_for('api_star_prompt') }}", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: action })
+  }).catch(function () {});
+}
+document.getElementById('star-prompt-modal').addEventListener('click', function (e) {
+  if (e.target === this) dismissStarPrompt('remind');
+});
 </script>
 
 <script>

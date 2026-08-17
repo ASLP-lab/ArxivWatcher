@@ -38,7 +38,10 @@ STORE_FILES: dict[str, str] = {
     "reading_list": "reading_list.json",
     "users": "users.json",
     "visits": "visits.json",
+    "feature_usage": "feature_usage.json",
     "arxiv_versions": "arxiv_versions.json",
+    "star_prompt": "star_prompt.json",
+    "daily_digests": "daily_digests.json",
 }
 
 DEFAULT_SQLITE_NAME = "app.db"
@@ -129,6 +132,14 @@ class _SqliteBackend:
                 f'INSERT OR REPLACE INTO "{self.table}" (k, v) VALUES (?, ?)',
                 [(k, json.dumps(v, ensure_ascii=False)) for k, v in data.items()],
             )
+
+
+def shared_sqlite_conn(db_path: Path) -> sqlite3.Connection:
+    """返回指定 db 文件的进程内共享连接（WAL 模式）。
+
+    供需要跨进程原子性、绕开 Store 内存缓存的场景使用（如 star prompt 计数器）。
+    """
+    return _SqliteBackend._get_conn(Path(db_path))
 
 
 # ─────────────────────────────────────────────

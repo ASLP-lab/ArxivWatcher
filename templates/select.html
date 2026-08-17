@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}站点择优 · ArxivWatcher{% endblock %}
+
+{% block content %}
+<section class="select-page">
+  <div class="select-hero">
+    <div>
+      <p class="select-eyebrow">SITE SELECTOR</p>
+      <h1>选择访问节点</h1>
+      <p>请选择适合当前网络环境的站点进入。</p>
+    </div>
+  </div>
+
+  {% if sites %}
+  <div class="select-list">
+    {% for site in sites %}
+    <article class="select-site">
+      <div class="select-site-main">
+        <strong>{{ site.name }}</strong>
+        <span class="select-site-url">{{ site.url }}</span>
+      </div>
+      <a class="nav-btn select-open" href="{{ site.url }}" rel="noopener noreferrer">打开</a>
+    </article>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-hint big">
+    <h1>尚未配置可选节点</h1>
+    <p>复制 <code>config/select_sites.example.txt</code> 为 <code>config/select_sites.txt</code>，按说明填写 HTTP/HTTPS 地址后刷新页面。</p>
+  </div>
+  {% endif %}
+</section>
+{% endblock %}

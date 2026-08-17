@@ -7,6 +7,18 @@ cd "$ROOT"
 INTERNAL_PATHS=(
   start_web_internal.sh
   run_internal.sh
+  llm_config.sh
+  blacklist.txt
+  highlight_authors.txt
+  featured_authors.txt
+  select_sites.txt
+  config/llm_config.sh
+  config/llm_config.local.sh
+  config/blacklist.txt
+  config/highlight_authors.txt
+  config/featured_authors.txt
+  config/select_sites.txt
+  pubkey_admin
 )
 
 DATA_PATHS=(
@@ -29,6 +41,12 @@ done
 
 git add \
   .gitignore \
+  .dockerignore \
+  Dockerfile \
+  docker-compose.yml \
+  pyproject.toml \
+  requirements.txt \
+  uv.lock \
   arxiv_version.py \
   web.py \
   storage.py \
@@ -48,7 +66,12 @@ git add \
   README.md \
   send.py \
   arxiv_daily_digest.py \
-  scripts/stage_for_github.sh
+  scripts/stage_for_github.sh \
+  config/blacklist.example.txt \
+  config/highlight_authors.example.txt \
+  config/featured_authors.example.txt \
+  config/select_sites.example.txt \
+  config/llm_config.example.sh
 
 echo "=== Staged ==="
 git diff --cached --name-only

@@ -1,6 +1,6 @@
 [project]
 name = "arxivwatcher"
-version = "2.0.0"
+version = "2.1.0"
 description = "ArxivWatcher — arXiv 每日论文监控与精读工具，自动抓取、LLM深度解读、邮件推送"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -34,4 +34,5 @@ dependencies = [
     "ldap3>=2.9.1",
     "pillow>=12.2.0",
     "pymupdf>=1.27.2.3",
+    "geoip2>=5.0",
 ]

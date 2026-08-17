@@ -109,6 +109,13 @@ def _mcp_tools_call(req_id: Any, params: dict) -> dict:
             {"content": [{"type": "text", "text": f"⚠️ 内部错误: {e}"}], "isError": True},
             req_id,
         )
+    try:
+        # 延迟导入避免 web.py 注册 MCP 时产生循环依赖；仅成功执行的具体工具计数，
+        # initialize / tools/list / ping 等协议握手不算功能使用。
+        import web
+        web.record_feature_usage("mcp")
+    except Exception as e:  # 统计失败不应改变 MCP 工具本身的成功结果
+        log.warning("MCP 功能使用统计写入失败: %s", e)
     return _jsonrpc_result(
         {"content": [{"type": "text", "text": text}]},
         req_id,

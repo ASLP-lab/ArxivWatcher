@@ -1,0 +1,35 @@
+<section class="geo-stats-section" id="geo-stats-section" style="display:none">
+  <div class="geo-stats-head">
+    <h2 class="geo-stats-title">访客来源</h2>
+    <span class="geo-stats-range" id="geo-stats-range"></span>
+    <span class="geo-stats-total" id="geo-stats-total"></span>
+  </div>
+  <div class="geo-stats-body">
+    <div class="geo-map-wrap" id="geo-map-wrap">
+      <div class="geo-map" id="geo-map"></div>
+      <div class="geo-inset" id="geo-inset" title="南海诸岛"></div>
+      <div class="geo-map-tip" id="geo-map-tip" style="display:none"></div>
+      <div class="geo-map-legend" id="geo-map-legend"></div>
+      <div class="geo-map-approval" id="geo-map-approval">地图来源：高德地图</div>
+    </div>
+    <div class="geo-ranks">
+      <aside class="geo-rank">
+        <div class="geo-rank-title">国家/地区 Top 30</div>
+        <ol class="geo-rank-list" id="geo-country-rank-list"></ol>
+      </aside>
+      <aside class="geo-rank">
+        <div class="geo-rank-title">国内省份 / 境外国家 Top 30</div>
+        <ol class="geo-rank-list" id="geo-region-rank-list"></ol>
+        <p class="geo-rank-note">GeoLite 无法定位到具体省份的中国访问，会单独计入“中国（省份未知）”。</p>
+      </aside>
+    </div>
+  </div>
+</section>
+<script src="{{ static_asset('geo_stats.js') }}"></script>
+<script>
+  ArxivGeo.init({
+    key: {{ amap_js_key|tojson }},
+    securityCode: {{ amap_js_security_code|tojson }},
+    api: {{ url_for('api_geo_stats')|tojson }}
+  });
+</script>

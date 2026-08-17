@@ -1,0 +1,6 @@
+# 一行一个可选访问节点。
+# 格式：显示名称 | URL；也可以只写 URL。
+# 复制为 config/select_sites.txt 后修改。实际配置文件不会提交到 Git 或打进镜像。
+主站 | https://arxiv.example.com/
+备用站 | http://arxiv-backup.example.com/
+https://another.example.com/

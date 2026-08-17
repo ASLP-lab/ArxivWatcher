@@ -102,7 +102,7 @@ async function downloadReportHTML(date) {
 }
 
 function reportTitle(date) {
-  return `arXiv 每日精读报告 ${date}`;
+  return `ArxivWatcher 报告 ${date}`;
 }
 
 function reportViewURL(date) {

@@ -61,7 +61,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from dataclasses import dataclass, asdict, field, fields
@@ -77,6 +77,10 @@ from bs4 import BeautifulSoup
 from pypdf import PdfReader
 import markdown
 
+from fetch_author_papers import ArxivAPIError, fetch_author_papers
+
+from daily_digest import generate_daily_digest, generate_digest_from_json
+
 BJ_TZ = ZoneInfo("Asia/Shanghai")
 
 
@@ -87,11 +91,21 @@ def now_bj() -> datetime:
 
 # 项目根目录（用于定位数据目录），优先使用 SEND_EMAIL_ROOT 环境变量
 PROJECT_ROOT = Path(os.environ.get("SEND_EMAIL_ROOT", Path(__file__).resolve().parent))
+CONFIG_DIR = Path(os.environ.get("ARXIVWATCHER_CONFIG_DIR") or (PROJECT_ROOT / "config"))
+
+
+def _config_path(name: str) -> Path:
+    preferred = CONFIG_DIR / name
+    legacy = PROJECT_ROOT / name
+    return preferred if preferred.exists() or not legacy.exists() else legacy
+
+
 DATA_DIR = PROJECT_ROOT / "data" / "papers"
 REPORTS_DIR = PROJECT_ROOT / "reports"
 ORG_KB_PATH = PROJECT_ROOT / "universities_companies_levels.jsonl"
 TAXONOMY_PATH = PROJECT_ROOT / "speech_audio_taxonomy.json"
-BLACKLIST_PATH = PROJECT_ROOT / "blacklist.txt"
+BLACKLIST_PATH = _config_path("blacklist.txt")
+FEATURED_AUTHORS_PATH = _config_path("featured_authors.txt")
 # 飞书 / 离线测试用：默认使用已导出的论文快照（元数据 + 摘要等「总结」字段）
 DEFAULT_TEST_FEISHU_JSON = DATA_DIR / "2026-05-15.json"
 # ─────────────────────────────────────────────
@@ -111,6 +125,10 @@ DEFAULT_LLM_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_LLM_MODEL = "gpt-4o"
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_LLM_CONCURRENCY = 4
+
+FEATURED_LOOKBACK_DAYS = 5
+FEATURED_DEDUP_DAYS = 10
+FEATURED_AUTHOR_REQUEST_DELAY = 3.0
 
 REQUEST_DELAY = 2        # arXiv 礼貌爬取间隔（秒）
 PDF_DOWNLOAD_TIMEOUT = 60
@@ -191,6 +209,7 @@ class Paper:
     score: float = 0.0                                          # LLM 综合评分 1-10
     blacklisted: bool = False                                   # 是否命中黑名单
     blacklist_reason: str = ""                                  # 命中黑名单的原因
+    featured_authors: list[str] = field(default_factory=list)   # 命中的大佬作者
     error: Optional[str] = None
 
 
@@ -499,6 +518,193 @@ def fetch_all_categories(categories: list[str]) -> list[Paper]:
     cross_count = sum(1 for p in merged if p.is_cross_list or len(p.source_categories) > 1)
     log.info(f"合并去重完成: {len(merged)} 篇唯一论文（{cross_count} 篇跨领域）")
     return merged
+
+
+# ─────────────────────────────────────────────
+# 大佬论文：近 5 天发现 + 近 10 天解读去重
+# ─────────────────────────────────────────────
+
+def _normalize_author_name(name: str) -> str:
+    """用于本地作者核验：忽略大小写、标点、连字符和多余空格。"""
+    return " ".join(re.findall(r"[\w]+", (name or "").casefold(), flags=re.UNICODE))
+
+
+def load_featured_authors(path: Path = FEATURED_AUTHORS_PATH) -> list[str]:
+    """读取大佬作者名单；一行一个姓名，忽略空行、注释及重复项。"""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        log.warning(f"大佬作者名单不存在，跳过大佬论文检查: {path}")
+        return []
+    except OSError as exc:
+        log.warning(f"大佬作者名单读取失败，跳过大佬论文检查: {exc}")
+        return []
+
+    authors: list[str] = []
+    seen: set[str] = set()
+    for raw_line in lines:
+        name = raw_line.split("#", 1)[0].strip()
+        normalized = _normalize_author_name(name)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        authors.append(name)
+    return authors
+
+
+def _author_name_matches(actual: str, expected: str) -> bool:
+    """匹配正常顺序或 ``姓, 名`` 顺序的完整作者姓名。"""
+    actual_norm = _normalize_author_name(actual)
+    expected_norm = _normalize_author_name(expected)
+    if not actual_norm or not expected_norm:
+        return False
+    if actual_norm == expected_norm:
+        return True
+    return actual_norm.split() == list(reversed(expected_norm.split()))
+
+
+def _record_has_valid_analysis(record: dict) -> bool:
+    if str(record.get("analysis_html") or "").strip():
+        return True
+    analysis = str(record.get("analysis") or "").strip()
+    return bool(
+        analysis
+        and not analysis.startswith("[LLM")
+        and not analysis.startswith("[PDF")
+    )
+
+
+def recently_analyzed_paper_ids(
+    reference_date: date,
+    *,
+    lookback_days: int = FEATURED_DEDUP_DAYS,
+    data_dir: Path = DATA_DIR,
+) -> set[str]:
+    """收集截至 ``reference_date`` 最近若干自然日已有有效解读的 arXiv ID。"""
+    if lookback_days < 1:
+        return set()
+    first_date = reference_date - timedelta(days=lookback_days - 1)
+    analyzed: set[str] = set()
+    for path in data_dir.glob("*.json"):
+        try:
+            file_date = date.fromisoformat(path.stem)
+        except ValueError:
+            continue
+        if file_date < first_date or file_date > reference_date:
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            log.warning(f"大佬论文去重：忽略无法读取的 {path.name}: {exc}")
+            continue
+        for collection in ("papers", "featured_papers", "extra_papers"):
+            for record in payload.get(collection) or []:
+                if not isinstance(record, dict) or not _record_has_valid_analysis(record):
+                    continue
+                paper_id = str(record.get("paper_id") or "").strip()
+                if paper_id:
+                    analyzed.add(re.sub(r"v\d+$", "", paper_id, flags=re.I))
+    return analyzed
+
+
+def _featured_api_record_to_paper(record: dict, featured_author: str) -> Paper:
+    categories = [str(c) for c in (record.get("categories") or []) if c]
+    primary = str(record.get("primary_category") or "")
+    if primary and primary not in categories:
+        categories.insert(0, primary)
+    return Paper(
+        paper_id=str(record.get("arxiv_id") or ""),
+        title=str(record.get("title") or ""),
+        authors=[str(a) for a in (record.get("authors") or []) if a],
+        comments=str(record.get("comment") or ""),
+        subjects="; ".join(categories),
+        abstract=str(record.get("summary") or ""),
+        pdf_url=str(record.get("pdf_url") or ""),
+        abs_url=str(record.get("entry_url") or ""),
+        source_categories=categories,
+        primary_category=primary,
+        is_cross_list=False,
+        featured_authors=[featured_author],
+    )
+
+
+def fetch_featured_author_papers(
+    reference_date: date,
+    *,
+    authors: Optional[list[str] | tuple[str, ...]] = None,
+    lookback_days: int = FEATURED_LOOKBACK_DAYS,
+    inter_author_delay: float = FEATURED_AUTHOR_REQUEST_DELAY,
+    fetcher: Callable = fetch_author_papers,
+) -> list[Paper]:
+    """从 arXiv 获取大佬作者近期论文，并在本地做忽略大小写的完整姓名核验。"""
+    configured_authors = load_featured_authors() if authors is None else list(authors)
+    if not configured_authors:
+        log.info("大佬论文：作者名单为空，跳过")
+        return []
+    found: dict[str, Paper] = {}
+    for index, featured_author in enumerate(configured_authors):
+        log.info(f"大佬论文：检查 {featured_author} 最近 {lookback_days} 天…")
+        try:
+            result = fetcher(
+                featured_author,
+                lookback_days,
+                end_date=reference_date,
+            )
+        except (ArxivAPIError, ValueError, OSError, requests.RequestException) as exc:
+            log.warning(f"大佬论文：{featured_author} 查询失败，跳过: {exc}")
+            continue
+        for record in result.get("papers") or []:
+            if not isinstance(record, dict):
+                continue
+            if not any(
+                _author_name_matches(str(actual), featured_author)
+                for actual in record.get("authors") or []
+            ):
+                log.debug(
+                    "大佬论文：作者核验未通过 %s — %s",
+                    featured_author,
+                    record.get("title") or record.get("arxiv_id"),
+                )
+                continue
+            paper = _featured_api_record_to_paper(record, featured_author)
+            if not paper.paper_id:
+                continue
+            existing = found.get(paper.paper_id)
+            if existing:
+                if featured_author not in existing.featured_authors:
+                    existing.featured_authors.append(featured_author)
+            else:
+                found[paper.paper_id] = paper
+        if index + 1 < len(configured_authors) and inter_author_delay > 0:
+            time.sleep(inter_author_delay)
+    log.info(f"大佬论文：近 {lookback_days} 天共发现 {len(found)} 篇")
+    return list(found.values())
+
+
+def partition_featured_papers(
+    papers: list[Paper],
+    featured_candidates: list[Paper],
+    recently_analyzed: set[str],
+) -> tuple[list[Paper], list[Paper], set[str]]:
+    """拆分普通/大佬论文；历史已解读和当天重复项都不会进入普通处理队列。"""
+    skipped_ids = {
+        p.paper_id for p in featured_candidates if p.paper_id in recently_analyzed
+    }
+    normal_by_id = {p.paper_id: p for p in papers}
+    featured_papers: list[Paper] = []
+    for featured in featured_candidates:
+        if featured.paper_id in skipped_ids:
+            continue
+        normal = normal_by_id.get(featured.paper_id)
+        if normal:
+            normal.featured_authors = list(featured.featured_authors)
+            featured_papers.append(normal)
+        else:
+            featured_papers.append(featured)
+
+    candidate_ids = {p.paper_id for p in featured_candidates}
+    normal_papers = [p for p in papers if p.paper_id not in candidate_ids]
+    return normal_papers, featured_papers, skipped_ids
 
 
 # ─────────────────────────────────────────────
@@ -1591,7 +1797,7 @@ def generate_html_report(
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>arXiv 每日论文精读 — {_escape_html(cat_labels)} | {today}</title>
+<title>ArxivWatcher — {_escape_html(cat_labels)} | {today}</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
   :root {{
@@ -1674,7 +1880,7 @@ def generate_html_report(
 <body>
 <div class="container">
   <header class="report-header">
-    <h1>arXiv 每日论文精读</h1>
+    <h1>ArxivWatcher</h1>
     <div class="subtitle">📡 {_escape_html(cat_labels)}</div>
     <div class="subtitle-cats">{_escape_html(cat_names)}</div>
     <div class="date">{today}</div>
@@ -1736,6 +1942,7 @@ def export_papers_json(
     date_str: str,
     llm_config: LLMConfig,
     *,
+    featured_papers: Optional[list[Paper]] = None,
     skip_llm_analysis: bool = False,
     in_progress: bool = False,
 ) -> Path:
@@ -1749,6 +1956,12 @@ def export_papers_json(
         record.pop("full_text", None)
         paper_records.append(record)
 
+    featured_records = []
+    for p in featured_papers or []:
+        record = asdict(p)
+        record.pop("full_text", None)
+        featured_records.append(record)
+
     payload = {
         "date": date_str,
         "generated_at": now_bj().isoformat(),
@@ -1756,10 +1969,14 @@ def export_papers_json(
         "llm_model": "" if skip_llm_analysis else llm_config.model,
         "skip_llm_analysis": skip_llm_analysis,
         "in_progress": in_progress,
-        "total": len(papers),
+        "total": len(papers) + len(featured_records),
+        "featured_count": len(featured_records),
         "cross_count": sum(
-            1 for p in papers if p.is_cross_list or len(p.source_categories) > 1
+            1
+            for p in [*papers, *(featured_papers or [])]
+            if p.is_cross_list or len(p.source_categories) > 1
         ),
+        "featured_papers": featured_records,
         "papers": paper_records,
     }
 
@@ -1767,7 +1984,10 @@ def export_papers_json(
     tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp_path.replace(out_path)
     if in_progress:
-        log.info(f"📦 论文元数据检查点: {out_path} ({len(papers)} 篇)")
+        log.info(
+            f"📦 论文元数据检查点: {out_path} "
+            f"({len(papers)} 篇常规 + {len(featured_records)} 篇大佬论文)"
+        )
     else:
         log.info(f"📦 论文元数据已导出: {out_path}")
     return out_path
@@ -2384,7 +2604,7 @@ def send_feishu_message(
         1 for p in papers if p.is_cross_list or len(p.source_categories) > 1
     )
     lines = [
-        f"📚 arXiv 每日精读 — {date_str}",
+        f"ArxivWatcher — {date_str}",
         f"📡 分类: {cat_str}",
         f"📊 共 {len(papers)} 篇 (跨领域 {cross_count} 篇)",
     ]
@@ -2452,7 +2672,7 @@ def send_email(html_content: str, categories: list[str], config: dict):
     """通过 SMTP 发送 HTML 邮件。"""
     today = now_bj().strftime("%Y-%m-%d")
     cat_str = " / ".join(categories)
-    subject = f"📚 arXiv 每日精读 [{cat_str}] — {today}"
+    subject = f"ArxivWatcher [{cat_str}] — {today}"
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
@@ -2460,7 +2680,7 @@ def send_email(html_content: str, categories: list[str], config: dict):
     msg["To"] = config["email_to"]
 
     msg.attach(MIMEText(
-        f"arXiv 每日论文精读报告 ({cat_str})\n\n请使用支持 HTML 的邮件客户端查看完整报告。",
+        f"ArxivWatcher 报告 ({cat_str})\n\n请使用支持 HTML 的邮件客户端查看完整报告。",
         "plain", "utf-8",
     ))
     msg.attach(MIMEText(html_content, "html", "utf-8"))
@@ -2477,13 +2697,101 @@ def send_email(html_content: str, categories: list[str], config: dict):
         raise
 
 
+def send_digest_email(digest_text: str, categories: list[str], config: dict):
+    """Send daily digest as plain-text email via SMTP."""
+    today = now_bj().strftime("%Y-%m-%d")
+    cat_str = " / ".join(categories)
+    subject = f"ArxivWatcher 每日综述 [{cat_str}] - {today}"
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = config["smtp_user"]
+    msg["To"] = config["email_to"]
+
+    msg.attach(MIMEText(digest_text, "plain", "utf-8"))
+    html_body = (
+        '<html><body style="font-family: monospace; white-space: pre-wrap; '
+        'line-height: 1.6; max-width: 800px; margin: 0 auto; padding: 16px;">'
+        f'{digest_text}\n</body></html>'
+    )
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    log.info(f"正在发送综述邮件至 {config['email_to']}...")
+    try:
+        with smtplib.SMTP(config["smtp_host"]) as server:
+            server.starttls()
+            server.login(config["smtp_user"], config["smtp_pass"])
+            server.sendmail(config["smtp_user"], config["email_to"], msg.as_string())
+        log.info("综述邮件发送成功！")
+    except Exception as e:
+        log.error(f"综述邮件发送失败: {e}")
+        raise
+
+
+def send_feishu_digest(
+    digest_text: str,
+    date_str: str,
+    webhook_url: str,
+    public_url: str = "",
+) -> None:
+    """Send plain-text daily digest to Feishu webhook."""
+    if not webhook_url:
+        log.info("未设置 FEISHU_WEBHOOK_URL，跳过飞书推送")
+        return
+
+    header = f"ArxivWatcher 每日综述 - {date_str}"
+    if public_url:
+        header += f"\n在线查看完整解读: {public_url}"
+
+    message_text = f"{header}\n\n{digest_text}"
+    content = {"text": message_text}
+    payload = {"msg_type": "text", "content": content}
+    json_payload = json.dumps(payload, ensure_ascii=False)
+    headers = {"Content-Type": "application/json"}
+
+    log.info(f"发送每日综述到飞书 webhook ({len(digest_text)} 字符)...")
+    last_err: Optional[Exception] = None
+    for attempt in range(1, FEISHU_MAX_RETRIES + 1):
+        try:
+            resp = requests.post(
+                webhook_url,
+                data=json_payload,
+                headers=headers,
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = (
+                resp.json()
+                if resp.headers.get("content-type", "").startswith("application/json")
+                else {}
+            )
+            if not _feishu_response_ok(data):
+                raise RuntimeError(f"飞书返回非成功状态: {data}")
+            log.info("飞书综述消息发送成功")
+            return
+        except Exception as e:
+            last_err = e
+            if attempt < FEISHU_MAX_RETRIES:
+                delay = random.uniform(2, 10)
+                log.warning(
+                    f"飞书综述发送失败 (第 {attempt}/{FEISHU_MAX_RETRIES} 次): {e}，"
+                    f"{delay:.1f}s 后重试"
+                )
+                time.sleep(delay)
+            else:
+                log.error(
+                    f"飞书综述发送失败，已重试 {FEISHU_MAX_RETRIES} 次: {e}"
+                )
+                raise last_err
+
+
 # ─────────────────────────────────────────────
 # 主流程
 # ─────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="arXiv 每日论文精读 — 多领域 + OpenAI 兼容 API",
+        description="ArxivWatcher — 多领域 + OpenAI 兼容 API",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
@@ -2555,6 +2863,12 @@ def main():
         "--retry-failed",
         action="store_true",
         help="仅重试失败论文：解读失败→重跑解读（下载PDF→LLM）；筛选失败→重跑筛选",
+    )
+
+    parser.add_argument(
+        "--digest-only",
+        action="store_true",
+        help="仅从已有 JSON 快照生成每日综述（不抓取 / 不解读 / 不推送），需配合 --date",
     )
     parser.add_argument(
         "--date",
@@ -2663,8 +2977,28 @@ def main():
         )
         sys.exit(0)
 
+    if args.digest_only:
+        date_str = args.date or now_bj().strftime("%Y-%m-%d")
+        log.info("=" * 60)
+        log.info(f"每日综述重生成 - {date_str}")
+        log.info("=" * 60)
+        try:
+            digest_text = generate_digest_from_json(date_str, llm_config)
+            if digest_text:
+                log.info(f"✅ 综述已生成 ({len(digest_text)} 字符)")
+            else:
+                log.error("综述生成失败")
+                sys.exit(1)
+        except FileNotFoundError as e:
+            log.error(str(e))
+            sys.exit(1)
+        except Exception as e:
+            log.error(f"综述生成失败: {e}", exc_info=True)
+            sys.exit(1)
+        sys.exit(0)
+
     log.info("=" * 60)
-    log.info("arXiv 每日论文精读 v2.0")
+    log.info("ArxivWatcher v2.0")
     log.info("=" * 60)
     log.info(f"分类: {', '.join(args.category)}")
     if args.no_llm:
@@ -2678,6 +3012,8 @@ def main():
     work_dir = Path("arxiv_digest_work")
     pdf_dir = work_dir / "pdfs"
     pdf_dir.mkdir(parents=True, exist_ok=True)
+    today_date = now_bj().date()
+    today = today_date.isoformat()
 
     # ── 获取论文（多分类合并去重）──
     if len(args.category) == 1:
@@ -2690,16 +3026,35 @@ def main():
         papers = [p for p in papers if not p.is_cross_list]
         log.info(f"排除跨领域: {len(papers)} 篇 (移除 {before - len(papers)})")
 
-    if not papers:
-        log.warning("今日无新论文，退出")
-        sys.exit(0)
-
     if args.max_papers:
         papers = papers[: args.max_papers]
         log.info(f"限制: {len(papers)} 篇")
+
+    # ── 大佬论文：近 5 天发现，近 10 天已有有效解读则跳过 ──
+    featured_candidates = fetch_featured_author_papers(today_date)
+    recently_analyzed = recently_analyzed_paper_ids(today_date)
+    papers, featured_papers, skipped_featured_ids = partition_featured_papers(
+        papers,
+        featured_candidates,
+        recently_analyzed,
+    )
+    if skipped_featured_ids:
+        log.info(
+            "大佬论文：近 10 天已解读，跳过 %d 篇: %s",
+            len(skipped_featured_ids),
+            ", ".join(sorted(skipped_featured_ids)),
+        )
+    if not papers and not featured_papers:
+        log.warning("今日无新论文或待解读的大佬论文，退出")
+        sys.exit(0)
+
+    processing_papers = [*featured_papers, *papers]
+    if featured_papers:
+        log.info(f"大佬论文：本次新增解读 {len(featured_papers)} 篇")
+
     if args.only_download:
         log.info("正在下载 PDF...")
-        for paper in papers:
+        for paper in processing_papers:
             print(paper.title)
             download_pdf(paper, pdf_dir)
         log.info("PDF 下载完成")
@@ -2723,12 +3078,11 @@ def main():
 
     # ── 逐篇处理 ──
     workers = resolve_llm_concurrency(llm_config)
-    today = now_bj().strftime("%Y-%m-%d")
-
     if not args.no_json:
         try:
             export_papers_json(
                 papers, args.category, today, llm_config,
+                featured_papers=featured_papers,
                 skip_llm_analysis=args.no_llm,
                 in_progress=True,
             )
@@ -2736,9 +3090,13 @@ def main():
             log.warning(f"初始 JSON 导出失败: {e}")
 
     if args.no_llm:
-        for i, paper in enumerate(papers, 1):
+        for i, paper in enumerate(processing_papers, 1):
             cross_mark = " [跨领域]" if (paper.is_cross_list or len(paper.source_categories) > 1) else ""
-            log.info(f"\n[{i}/{len(papers)}] {paper.title[:60]}...{cross_mark}")
+            featured_mark = " [大佬论文]" if paper.featured_authors else ""
+            log.info(
+                f"\n[{i}/{len(processing_papers)}] "
+                f"{paper.title[:60]}...{cross_mark}{featured_mark}"
+            )
             if org_kb and llm_config.api_key:
                 attach_related_orgs_to_paper(paper, org_kb, llm_config)
                 if paper.related_org_titles:
@@ -2772,15 +3130,16 @@ def main():
             try:
                 export_papers_json(
                     papers, args.category, today, llm_config,
+                    featured_papers=featured_papers,
                     skip_llm_analysis=False,
                     in_progress=(done < total),
                 )
             except Exception as e:
                 log.warning(f"检查点 JSON 导出失败: {e}")
 
-        log.info(f"\n开始 LLM 处理 {len(papers)} 篇论文（并发 {workers}）…")
+        log.info(f"\n开始 LLM 处理 {len(processing_papers)} 篇论文（并发 {workers}）…")
         run_with_concurrency(
-            papers,
+            processing_papers,
             process_one,
             workers,
             progress_callback=on_paper_progress,
@@ -2789,7 +3148,10 @@ def main():
     # ── 生成报告 ──
     log.info("\n正在生成 HTML 报告...")
     html_report = generate_html_report(
-        papers, args.category, llm_config, skip_llm_analysis=args.no_llm
+        processing_papers,
+        args.category,
+        llm_config,
+        skip_llm_analysis=args.no_llm,
     )
 
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -2804,11 +3166,29 @@ def main():
         try:
             export_papers_json(
                 papers, args.category, today, llm_config,
+                featured_papers=featured_papers,
                 skip_llm_analysis=args.no_llm,
                 in_progress=False,
             )
         except Exception as e:
             log.error(f"JSON 导出失败: {e}", exc_info=True)
+
+    # ── 生成每日论文综述 ──
+    digest_text = None
+    if not args.no_llm:
+        log.info("\n正在生成每日论文综述...")
+        try:
+            digest_text = generate_daily_digest(
+                papers, featured_papers, args.category, today, llm_config,
+            )
+            if digest_text:
+                log.info(f"每日综述已生成 ({len(digest_text)} 字符)")
+            else:
+                log.warning("综述生成失败，邮件/飞书将使用 HTML 报告")
+        except Exception as e:
+            log.error(f"综述生成失败: {e}", exc_info=True)
+    else:
+        log.info("已跳过综述生成 (--no-llm)")
 
     # ── 邮件 ──
     if not args.no_email:
@@ -2823,7 +3203,10 @@ def main():
             log.warning("邮件配置不完整，跳过。设置 SMTP_USER, SMTP_PASS, EMAIL_TO")
         else:
             try:
-                send_email(html_report, args.category, email_config)
+                if digest_text:
+                    send_digest_email(digest_text, args.category, email_config)
+                else:
+                    send_email(html_report, args.category, email_config)
             except Exception as e:
                 log.error(f"邮件发送失败: {e}", exc_info=True) 
     else:
@@ -2837,9 +3220,16 @@ def main():
             log.info("未配置 FEISHU_WEBHOOK_URL，跳过飞书推送")
         else:
             try:
-                send_feishu_message(
-                    papers, args.category, today, feishu_webhook, public_url
-                )
+                if digest_text:
+                    send_feishu_digest(digest_text, today, feishu_webhook, public_url)
+                else:
+                    send_feishu_message(
+                        processing_papers,
+                        args.category,
+                        today,
+                        feishu_webhook,
+                        public_url,
+                    )
             except Exception as e:
                 log.error(f"飞书推送失败: {e}", exc_info=True)
     else:

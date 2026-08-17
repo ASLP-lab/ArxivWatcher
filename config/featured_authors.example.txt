@@ -1,0 +1,3 @@
+# 一行一个需要主动追踪 arXiv 论文的作者姓名。
+Geoffrey Hinton
+Yoshua Bengio  # 支持行尾注释

@@ -60,6 +60,8 @@ services:
       # LDAP_BIND_PASSWORD: changeme
 
     volumes:
+      # 本地配置统一只读挂载（名单、测速站点、可选 LLM 配置）
+      - ./config:/app/config:ro
       # 持久化互动数据 / 用户 / 报告 / 论文索引 / secret_key
       - ./data:/app/data
       - ./reports:/app/reports
@@ -68,7 +70,7 @@ services:
       - arxiv_work:/app/arxiv_digest_work
 
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8091/"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8091/health"]
       interval: 30s
       timeout: 5s
       retries: 3

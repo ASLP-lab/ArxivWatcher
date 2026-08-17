@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}访问统计 · arXiv 每日精读{% endblock %}
+{% block title %}访问统计 · ArxivWatcher{% endblock %}
 
 {% block content %}
 <section class="stats-hero">
@@ -37,6 +37,22 @@
     <div class="stats-hero-num">—</div>
     <div class="stats-hero-foot">今日暂无数据</div>
     {% endif %}
+  </div>
+</section>
+
+<section class="stats-section">
+  <div class="stats-section-head">
+    <h2><span class="stats-section-icon">🧭</span> 最近 {{ feature_usage_days }} 天功能使用</h2>
+    <span class="stats-section-sub">{{ feature_usage_since }} ~ {{ feature_usage_until }}（北京时间）</span>
+  </div>
+  <div class="stats-hero stats-hero--feature-row">
+    {% for item in feature_usage_items %}
+    <div class="stats-hero-card stats-hero--feature">
+      <div class="stats-hero-label">{{ item.label }}</div>
+      <div class="stats-hero-num">{{ '{:,}'.format(item.total) }}</div>
+      <div class="stats-hero-foot">最近 {{ feature_usage_days }} 天总数</div>
+    </div>
+    {% endfor %}
   </div>
 </section>
 
@@ -138,8 +154,8 @@
       {% for d in token_recent %}
       <div class="day-col" data-tip="{{ d.date }} → 合计 {{ d.total }}（入 {{ d.input }} / 出 {{ d.output }} / 命中 {{ d.cached }}）">
         <div class="day-bar-wrap">
-          <div class="day-bar {% if d.is_today %}is-today{% endif %}"
-               style="height: {{ d.pct }}%; background: linear-gradient(180deg, #f59e0b, #fbbf24);"></div>
+          <div class="day-bar is-token {% if d.is_today %}is-today{% endif %}"
+               style="height: {{ d.pct }}%;"></div>
         </div>
         <div class="day-label">{{ d.date[5:] }}</div>
       </div>
@@ -168,4 +184,6 @@
   <p class="empty-hint">暂无 Token 记录（部署新统计后，新的 LLM 调用会自动累计）</p>
   {% endif %}
 </section>
+
+{% include "_geo_stats.html" %}
 {% endblock %}

@@ -1,10 +1,12 @@
 <div align="center">
 
-# 📡 ArxivWatcher
+<img src="static/logos/landscape_arxiv_watcher.png" alt="ArxivWatcher" width="560">
 
 **arXiv 论文每日自动监控与精读工具**
 
 抓取新论文 · LLM 结构化解读 · Web 浏览 · RSS 订阅 · Zotero 自动导入 · 可选邮件 / 飞书推送
+
+v2.1.0
 
 <!-- 徽章占位：按需替换为真实地址 -->
 <!--
@@ -29,6 +31,8 @@
   - [方式一：Docker 一键运行（推荐）](#方式一docker-一键运行推荐)
   - [方式二：本地源码运行](#方式二本地源码运行)
 - [核心配置速查](#-核心配置速查)
+- [本地名单配置](#-本地名单配置)
+- [访问节点选择](#-访问节点选择)
 - [运行与抓取](#-运行与抓取)
 - [Docker 部署详解](#-docker-部署详解)
 - [存储后端（JSON / SQLite）](#-存储后端json--sqlite)
@@ -135,8 +139,101 @@ bash start_web.sh
 | `SMTP_*` / `EMAIL_TO` | 邮件推送（可选） |
 | `FEISHU_WEBHOOK_URL` | 飞书机器人（可选） |
 | `WEB_PUBLIC_URL` | 对外访问地址（用于插件 xpi、飞书链接） |
+| `ARXIVWATCHER_CONFIG_DIR` | 本地配置目录，默认 `./config`（Docker 为 `/app/config`） |
 
 > 本地运行时也可直接在 `run.sh` / `start_web.sh` 的注释示例里改。
+
+---
+
+## 🗂️ 本地名单配置
+
+本地配置统一放在 `config/` 目录。首次使用可从同目录的 `*.example.*` 复制；实际配置可能反映个人关注方向或包含密钥，因此已加入 `.gitignore` 和 `.dockerignore`。文件不存在或内容为空时，对应功能会自动停用，不影响其他功能。
+
+### `config/blacklist.txt`：论文语义黑名单
+
+一行写一条**自然语言描述**，空行以及以 `#` 开头的注释会被忽略。例如：
+
+```text
+# 不希望重点阅读的工作
+只做说话人识别数据集上的常规增量改进，且没有新的方法贡献
+主要研究语音情感识别，与语音生成或理解无关
+仅发布 benchmark 或排行榜，没有实质算法创新
+```
+
+这不是标题关键词的硬过滤。程序会把这些描述交给第二阶段 LLM，让模型结合标题、摘要和深度解读进行语义判断。命中后论文仍会保留在报告中，但会标记为“黑名单 / 💤 可跳过”，Web 页面可隐藏黑名单论文。使用 `--no-llm` 或未配置 LLM 时不会执行该判断。
+
+修改后在下一次论文抓取或重新分类时生效，无需改代码。
+
+### `config/highlight_authors.txt`：Web 重点作者高亮
+
+一行一个作者姓名，支持空行和以 `#` 开头的注释：
+
+```text
+# 页面中需要醒目标出的作者
+Geoffrey Hinton
+Yoshua Bengio
+```
+
+Web 前端会对作者名做大小写、句点、逗号和空格归一化，也支持完整姓名、名字首字母缩写及包含匹配。命中只改变页面上的作者高亮样式，不会额外抓取论文。文件按修改时间自动重新加载；修改后刷新浏览器页面即可看到结果。
+
+### `config/featured_authors.txt`：主动追踪作者论文
+
+一行一个 arXiv 作者姓名，可在行尾使用 `#` 添加注释：
+
+```text
+Geoffrey Hinton
+Yoshua Bengio  # 深度学习
+```
+
+每日任务除了抓取配置的 arXiv 分类，还会查询名单中作者最近 5 天的论文，并在本地核验完整作者姓名。命中的论文会进入“大佬论文”区域；最近 10 天已经成功解读过的同一 arXiv 论文不会重复处理。姓名匹配忽略大小写、标点、连字符，并兼容 `姓, 名` 顺序。
+
+名单过长会增加 arXiv 请求和 LLM 分析数量；程序默认在不同作者请求之间等待 3 秒。
+
+### 创建本地配置
+
+按需复制示例，不使用的功能无需创建：
+
+```bash
+cp config/blacklist.example.txt config/blacklist.txt
+cp config/highlight_authors.example.txt config/highlight_authors.txt
+cp config/featured_authors.example.txt config/featured_authors.txt
+cp config/llm_config.example.sh config/llm_config.sh
+```
+
+Docker 不会把实际配置打进镜像。`docker-compose.yml` 已将整个目录只读挂载；使用 `docker run` 时增加一个 volume 即可：
+
+```bash
+-v "$PWD/config:/app/config:ro"
+```
+
+如需把配置放到其他位置，可设置 `ARXIVWATCHER_CONFIG_DIR`。升级旧部署时，根目录的同名文件仍可兼容读取，但建议迁入 `config/`。
+
+---
+
+## 🚦 访问节点选择
+
+访问 `/select` 可展示多个可选访问节点。页面不发起测速请求，用户可以根据当前所处网络直接选择校园网、内网或公网节点。
+
+先复制示例配置：
+
+```bash
+cp config/select_sites.example.txt config/select_sites.txt
+```
+
+`config/select_sites.txt` 每行填写一个节点，支持 `显示名称 | URL` 或纯 URL；空行及以 `#` 开头的行会被忽略：
+
+```text
+# 名称 | 访问地址
+主站 | https://arxiv.example.com/
+备用站 | http://arxiv-backup.example.com/
+https://another.example.com/
+```
+
+仅接受 `http://` 和 `https://` 地址，最多读取 50 个去重后的节点。修改文件后刷新 `/select` 即可，无需重启服务。
+
+实际配置可能包含内部站点，因此 `config/select_sites.txt` 已被 Git 和 Docker 构建上下文忽略。Docker 使用上文统一的 `./config:/app/config:ro` 挂载，无需再单独挂载文件。
+
+> 安全提示：公开部署时只应配置你信任的节点；内网地址只会显示为链接，不会由服务端主动请求。
 
 ---
 
@@ -197,7 +294,7 @@ docker compose pull && docker compose up -d   # 升级
 
 ```bash
 docker build -t aslplab/arxivwatcher:latest .
-docker build -t aslplab/arxivwatcher:2.0.0 .   # 带版本号
+docker build -t aslplab/arxivwatcher:2.1.0 .   # 带版本号
 ```
 
 > **国内构建提示**：若拉基础镜像超时，请先配 Docker 镜像加速器：
@@ -223,14 +320,14 @@ docker login
 
 # 2) 单架构推送
 docker push aslplab/arxivwatcher:latest
-docker push aslplab/arxivwatcher:2.0.0
+docker push aslplab/arxivwatcher:2.1.0
 
 # 3) 多架构（amd64 + arm64）一次性构建并推送，需要 buildx：
 docker buildx create --use --name multiarch
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
   -t aslplab/arxivwatcher:latest \
-  -t aslplab/arxivwatcher:2.0.0 \
+  -t aslplab/arxivwatcher:2.1.0 \
   --push .
 ```
 
@@ -263,6 +360,35 @@ docker buildx build \
 | `WEB_PUBLIC_URL` | 空 | 对外暴露的访问地址。用于飞书消息里的链接、Zotero 插件 `update_url`（须 HTTPS）。例：`https://arxiv.example.com` |
 | `ICP_BEIAN` | 空 | ICP 备案号，设置后页脚显示备案链接，留空则不显示。例：`陕ICP备XXXXX号-1` |
 | `ZOTERO_PLUGIN_UPDATE_URL` | 空 | 显式覆盖 Zotero 插件的 `update_url`；不设则用 `WEB_PUBLIC_URL` |
+
+#### 访客来源地图（可选）
+
+首页底部的"访客来源"统计基于 GeoLite2 本地数据库（`data/GeoLite2-City.mmdb`，缺失时自动从同目录 `.mmdb.gz` 解压）按天落库，展示最近 7 天。真实 IP 从 CDN 回源头 `Ali-Cdn-Real-Ip` 提取；地图使用高德 JS API 2.0 世界简易行政区图层。
+
+| 变量 | 默认值 | 说明 |
+|------|------|------|
+| `AMAP_JS_KEY` | 空 | 高德开放平台 Web 端（JS API）key。**留空则只显示来源排行榜、不加载地图** |
+| `AMAP_JS_SECURITY_CODE` | 空 | 高德 key 对应的安全密钥（securityJsCode），2021 年后创建的 key 必填 |
+
+> 注意：世界地图（`DistrictLayer.World`）属于高德高级能力，需在高德开放平台为该 key 申请世界地图权限；
+> 页面会显示高德底图审图号，请勿自行修改国界/海界。无 key 时功能完全降级为榜单展示，不影响其他功能。
+
+##### 获取 GeoLite2 资源文件
+
+GeoLite2 数据库受 MaxMind 许可约束，因此不随源码或 Docker 镜像分发。启用 IP 地理统计时：
+
+1. 注册免费的 [MaxMind GeoLite 账号](https://dev.maxmind.com/geoip/geolite2-free-geolocation-data/) 并在账号后台生成 license key；
+2. 下载 **GeoLite2 City** 的二进制 `MMDB` 版本（不是 CSV 版本）；
+3. 解压后将数据库重命名/复制为 `data/GeoLite2-City.mmdb`。也可以将 gzip 压缩文件放为 `data/GeoLite2-City.mmdb.gz`，程序首次使用时会自动解压；
+4. Docker 部署需把该文件放在宿主机的 `./data/` 中，再按示例挂载到 `/app/data`。不要把数据库、MaxMind 账号或 license key 提交到 Git。
+
+MaxMind 要求 GeoLite 数据保持更新，建议按其[官方更新说明](https://dev.maxmind.com/geoip/updating-databases/)定期替换文件。缺少该文件只会停用 IP 地理定位，不影响论文抓取和 Web 主功能。
+
+##### 其他资源文件
+
+- `speech_audio_taxonomy.json` 与 `universities_companies_levels.jsonl` 已随仓库提供，无需额外下载；
+- `config/featured_authors.txt` 是可选的私人关注名单，按 `config/featured_authors.example.txt` 创建；实际文件已被 Git 和 Docker 构建上下文忽略；
+- 页面 Logo/Favicon 位于 `static/logos/`，已随仓库提供。
 
 #### 存储
 
@@ -463,7 +589,7 @@ python storage_tool.py sqlite2json
 # 自定义路径：--data-dir ./data --db ./data/app.db
 ```
 
-可转换的集合：`interactions`、`comments`、`highlights`、`favorites`、`users`、`visits`。转换为「全量替换」语义，会用源端数据覆盖目标端对应集合。
+可转换的集合包括：`interactions`、`comments`、`highlights`、`favorites`、`users`、`visits`、`feature_usage`。转换为「全量替换」语义，会用源端数据覆盖目标端对应集合。
 
 ---
 
@@ -546,6 +672,7 @@ python storage_tool.py sqlite2json
 | `templates/` / `static/` | 前端 |
 | `zotero_plugin/` | Zotero 7+ 插件源码 |
 | `scripts/` | 工具脚本（索引重建、macOS launchd 示例） |
+| `config/` | 本地配置目录；提交示例文件，忽略实际配置与密钥 |
 | `data/papers/` | 运行时论文索引（git 忽略） |
 | `data/*.json` / `data/app.db` | 互动/评论/标记/收藏/用户/访问数据（git 忽略） |
 | `reports/` | 运行时 HTML 报告（git 忽略） |

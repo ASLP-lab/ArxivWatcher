@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}MCP 接入 — arXiv 每日精读{% endblock %}
+{% block title %}MCP 接入 — ArxivWatcher{% endblock %}
 
 {% block content %}
 <section class="page-header">
@@ -200,7 +200,7 @@ enabled = true</code></pre>
 .mcp-intro-card {
   background: var(--card-bg, #fff);
   border: 1px solid var(--border, #e5e7eb);
-  border-radius: 10px;
+  border-radius: var(--radius);
   padding: 18px 20px;
 }
 .mcp-intro-card h3 { margin: 0 0 8px; font-size: 15px; color: var(--fg, #1a1a1a); }
@@ -214,15 +214,15 @@ enabled = true</code></pre>
   border: 1px solid #ddd6fe;
   color: #5b21b6;
   padding: 6px 10px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   max-width: 100%;
   overflow-x: auto;
   white-space: nowrap;
 }
 .mcp-copy-btn {
   font-size: 12px; padding: 5px 12px; margin-left: 6px;
-  border: 1px solid var(--border, #e5e7eb); border-radius: 6px;
-  background: #fff; cursor: pointer; color: var(--fg, #1a1a1a);
+  border: 1px solid var(--border, #e5e7eb); border-radius: var(--radius-sm);
+  background: var(--surface-input); cursor: pointer; color: var(--fg, #1a1a1a);
 }
 .mcp-copy-btn:hover { background: #f5f3ff; border-color: #ddd6fe; }
 .mcp-note { font-size: 12px; color: var(--fg-muted, #888); margin-top: 6px; }
@@ -233,7 +233,7 @@ enabled = true</code></pre>
 .mcp-tool-group { font-size: 14px; color: #6d28d9; margin: 20px 0 10px; padding-bottom: 4px; border-bottom: 1px dashed #ddd6fe; }
 
 .mcp-tools-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
-.mcp-tool { background: #fafaf8; border: 1px solid var(--border, #e5e7eb); border-radius: 8px; padding: 12px 14px; }
+.mcp-tool { background: var(--surface-subtle); border: 1px solid var(--border, #e5e7eb); border-radius: var(--radius); padding: 12px 14px; }
 .mcp-tool h4 { margin: 0 0 4px; font-size: 13px; }
 .mcp-tool h4 code { color: #6d28d9; font-weight: 700; }
 .mcp-tool p { margin: 0; font-size: 12px; line-height: 1.5; color: var(--fg-muted, #666); }
@@ -252,7 +252,7 @@ enabled = true</code></pre>
 
 .mcp-section pre {
   background: #1e1e2e; color: #cdd6f4;
-  border-radius: 8px; padding: 14px 16px;
+  border-radius: var(--radius); padding: 14px 16px;
   font-size: 12.5px; line-height: 1.6;
   overflow-x: auto; margin: 0 0 12px;
 }
@@ -261,15 +261,15 @@ enabled = true</code></pre>
   font-size: 12.5px;
 }
 .mcp-section p code, .mcp-section li code {
-  background: #f3f4f6; padding: 1px 5px; border-radius: 4px; color: #5b21b6;
+  background: #f3f4f6; padding: 1px 5px; border-radius: var(--radius-sm); color: #5b21b6;
 }
 
 .mcp-examples { font-size: 13px; line-height: 1.9; padding-left: 20px; }
 .mcp-examples li { color: var(--fg, #333); }
 
 .mcp-faq details {
-  border: 1px solid var(--border, #e5e7eb); border-radius: 8px;
-  padding: 12px 16px; margin-bottom: 8px; background: #fff;
+  border: 1px solid var(--border, #e5e7eb); border-radius: var(--radius);
+  padding: 12px 16px; margin-bottom: 8px; background: var(--surface-input);
 }
 .mcp-faq summary { cursor: pointer; font-size: 14px; font-weight: 600; color: var(--fg, #1a1a1a); }
 .mcp-faq details[open] summary { margin-bottom: 8px; }
@@ -285,6 +285,12 @@ enabled = true</code></pre>
 :root[data-theme="dark"] .mcp-copy-btn:hover { background: #2a1f45; }
 :root[data-theme="dark"] .mcp-section p code,
 :root[data-theme="dark"] .mcp-section li code { background: #232530; color: #c4b5fd; }
+:root[data-theme="dark"] .mcp-intro-card a,
+:root[data-theme="dark"] .mcp-tool-group,
+:root[data-theme="dark"] .mcp-tool h4 code,
+:root[data-theme="dark"] .mcp-tab.active { color: #a78bfa; }
+:root[data-theme="dark"] .mcp-tab:hover { color: #c4b5fd; }
+:root[data-theme="dark"] .mcp-tool-group { border-bottom-color: rgba(167, 139, 250, 0.25); }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) .mcp-intro-card,
   :root:not([data-theme="light"]) .mcp-tool,
@@ -294,6 +300,12 @@ enabled = true</code></pre>
   :root:not([data-theme="light"]) .mcp-copy-btn:hover { background: #2a1f45; }
   :root:not([data-theme="light"]) .mcp-section p code,
   :root:not([data-theme="light"]) .mcp-section li code { background: #232530; color: #c4b5fd; }
+  :root:not([data-theme="light"]) .mcp-intro-card a,
+  :root:not([data-theme="light"]) .mcp-tool-group,
+  :root:not([data-theme="light"]) .mcp-tool h4 code,
+  :root:not([data-theme="light"]) .mcp-tab.active { color: #a78bfa; }
+  :root:not([data-theme="light"]) .mcp-tab:hover { color: #c4b5fd; }
+  :root:not([data-theme="light"]) .mcp-tool-group { border-bottom-color: rgba(167, 139, 250, 0.25); }
 }
 </style>
 {% endblock %}

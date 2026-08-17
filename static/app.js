@@ -3,6 +3,7 @@ var ArxivApp = (function () {
   var appDate = '';
   var appUser = null;
   var papers = [];
+  var featuredPapers = [];
   var extraPapers = [];
   var papersById = {};
   var interactions = {};
@@ -533,11 +534,42 @@ var ArxivApp = (function () {
     return '/api/paper-assets/' + appDate + '/' + encodeURIComponent(pid);
   }
 
-  function paperFiguresBlockHtml(pid) {
-    return '<div class="paper-figures" data-pid="' + escAttr(pid) + '">' +
-      '<div class="paper-figures-head"><span class="paper-figures-icon">🖼</span><span class="paper-figures-title">图表与表格</span></div>' +
-      '<div class="paper-figures-body"><div class="paper-figures-loading">加载中…</div></div>' +
+  // 图表区占位：figure_count 由列表 API 附带（服务端只读 assets manifest）。
+  // 已知数量 -> 渲染同尺寸骨架格，滚动到位后再换真图，避免页面跳动；
+  // 已知为 0 -> 不渲染图表块；未知 -> 保留原「加载中」行为。
+  function paperFiguresBlockHtml(p) {
+    var pid = p.paper_id;
+    var fcount = (typeof p.figure_count === 'number') ? p.figure_count : null;
+    if (fcount === 0) return '';
+    var head = '<div class="paper-figures-head"><span class="paper-figures-icon">🖼</span>' +
+      '<span class="paper-figures-title">图表与表格</span>';
+    if (fcount !== null) head += '<span class="paper-figures-count">' + fcount + '</span>';
+    head += '</div>';
+    var attrs = '';
+    var bodyHtml = '<div class="paper-figures-loading">加载中…</div>';
+    if (fcount !== null) {
+      var ftables = (typeof p.figure_tables === 'number') ? p.figure_tables : 0;
+      attrs = ' data-fcount="' + fcount + '" data-ftables="' + ftables + '"';
+      bodyHtml = figureSkeletonHtml(fcount, ftables);
+    }
+    return '<div class="paper-figures" data-pid="' + escAttr(pid) + '"' + attrs + '>' +
+      head +
+      '<div class="paper-figures-body">' + bodyHtml + '</div>' +
       '</div>';
+  }
+
+  function figureSkeletonHtml(count, tables) {
+    var html = '<div class="paper-figures-grid">';
+    var figs = Math.max(0, count - tables);
+    var i;
+    for (i = 0; i < tables; i++) {
+      html += '<div class="figure-skel figure-skel--table"><div class="figure-skel-thumb"></div><div class="figure-skel-cap"></div></div>';
+    }
+    for (i = 0; i < figs; i++) {
+      html += '<div class="figure-skel"><div class="figure-skel-thumb"></div><div class="figure-skel-cap"></div></div>';
+    }
+    html += '</div>';
+    return html;
   }
 
   var figuresObserver = null;
@@ -570,7 +602,9 @@ var ArxivApp = (function () {
     var body = block.querySelector('.paper-figures-body');
     if (!pid || !body) return;
     block.dataset.loading = '1';
-    body.innerHTML = '<div class="paper-figures-loading">加载图表…</div>';
+    if (!block.dataset.fcount) {
+      body.innerHTML = '<div class="paper-figures-loading">加载图表…</div>';
+    }
     fetch(paperAssetsApiUrl(pid), { credentials: 'same-origin' })
       .then(function (r) { return r.json(); })
       .then(function (d) {
@@ -731,6 +765,7 @@ var ArxivApp = (function () {
       loadReadingList(),
     ]).then(function (results) {
       papers = results[0].papers || [];
+      featuredPapers = results[0].featured_papers || [];
       extraPapers = results[0].extra_papers || [];
       interactions = (results[1].ok ? results[1].interactions : {}) || {};
       var favData = results[2] || {};
@@ -741,6 +776,11 @@ var ArxivApp = (function () {
       papersById = {};
       papers.forEach(function (p, i) {
         p._idx = i;
+        papersById[p.paper_id] = p;
+      });
+      featuredPapers.forEach(function (p, i) {
+        p._idx = i;
+        p._is_featured = true;
         papersById[p.paper_id] = p;
       });
       extraPapers.forEach(function (p, i) {
@@ -754,11 +794,10 @@ var ArxivApp = (function () {
         syncCommunityBtn();
       }
       var fab = document.getElementById('fab-stack');
-      if (fab && papers.length) fab.style.display = '';
+      if (fab && (papers.length || featuredPapers.length)) fab.style.display = '';
       refreshDomainFilterBar();
       refreshGradeFilterBar();
       renderPapers();
-      renderExtraPapers();
       renderReadingListDrawer();
       scrollToPaperFromHash();
     }).catch(function (err) {
@@ -904,7 +943,11 @@ var ArxivApp = (function () {
   function renderPapers() {
     var container = document.getElementById('paper-container');
     if (!papers.length) {
-      container.innerHTML = '<div class="empty-hint">暂无论文数据。</div>';
+      container.innerHTML = featuredPapers.length
+        ? ''
+        : '<div class="empty-hint">暂无论文数据。</div>';
+      renderFeaturedPapers();
+      renderExtraPapers();
       return;
     }
     var html = '';
@@ -920,6 +963,9 @@ var ArxivApp = (function () {
       html += '<span class="ia-icon" aria-hidden="true">🔗</span><span class="ia-label ia-share-label">分享</span></button>';
       html += '</div>';
       html += '<div class="paper-meta-line">';
+      if (p.featured_authors && p.featured_authors.length) {
+        html += '<span class="badge badge-featured">🌟 ' + esc(p.featured_authors.join(' / ')) + '</span>';
+      }
       if (p.source_categories) p.source_categories.forEach(function (c) { html += '<span class="cat-tag">' + esc(c) + '</span>'; });
       if (p.is_cross_list) html += '<span class="badge badge-cross">跨领域</span>';
       if (p.blacklisted) html += '<span class="badge badge-blacklist" title="' + escAttr(p.blacklist_reason || '') + '">黑名单</span>';
@@ -962,7 +1008,7 @@ var ArxivApp = (function () {
       if (p.abstract) {
         html += '<details class="abstract"><summary>查看摘要</summary><p>' + esc(p.abstract) + '</p></details>';
       }
-      html += paperFiguresBlockHtml(p.paper_id);
+      html += paperFiguresBlockHtml(p);
       // Analysis section (collapsible, 精读懒加载)
       if (p.has_analysis) {
         html += '<details class="analysis-section"><summary>📖 查看深度解读</summary>';
@@ -1006,33 +1052,35 @@ var ArxivApp = (function () {
     }
     setupArxivVersionLazyLoad();
     setupPaperFiguresLazyLoad();
+    renderFeaturedPapers();
+    renderExtraPapers();
   }
 
-  function renderExtraPapers() {
-    var existing = document.getElementById('extra-papers-container');
+  function renderSpecialPapers(items, opts) {
+    var existing = document.getElementById(opts.containerId);
     if (existing) existing.remove();
-    if (!extraPapers.length) return;
+    if (!items.length) return;
     if (appSinglePaperId) return; // 单篇分享页不显示
 
     var container = document.getElementById('paper-container');
     if (!container) return;
 
     var section = document.createElement('div');
-    section.id = 'extra-papers-container';
-    section.className = 'extra-papers-section';
+    section.id = opts.containerId;
+    section.className = opts.sectionClass;
 
     var header = document.createElement('div');
-    header.className = 'extra-papers-header';
-    header.innerHTML = '<span class="extra-papers-icon">🍱</span>' +
-      '<span class="extra-papers-title">额外论文解读</span>' +
-      '<span class="extra-papers-count">' + extraPapers.length + ' 篇</span>';
+    header.className = opts.headerClass;
+    header.innerHTML = '<span class="' + opts.iconClass + '">' + opts.icon + '</span>' +
+      '<span class="' + opts.titleClass + '">' + esc(opts.title) + '</span>' +
+      '<span class="' + opts.countClass + '">' + items.length + ' 篇</span>';
     section.appendChild(header);
 
     var listDiv = document.createElement('div');
     listDiv.className = 'paper-list-dynamic';
 
     var html = '';
-    extraPapers.forEach(function (p) {
+    items.forEach(function (p) {
       var idx = p._idx;
       var ia = interactions[p.paper_id] || { likes: 0, dislikes: 0, user_liked: false, user_disliked: false };
       var gr = paperGrade(p);
@@ -1040,11 +1088,14 @@ var ArxivApp = (function () {
       if (paperHasCelebrateAuthor(p)) html += celebrateCardDecorHtml();
       html += '<div class="paper-card-header">';
       html += '<div class="paper-card-title-row">';
-      html += '<h2><span class="paper-index paper-index-extra">加餐</span><a href="' + esc(p.abs_url) + '" target="_blank">' + esc(p.title) + '</a></h2>';
+      html += '<h2><span class="paper-index ' + opts.indexClass + '">' + opts.cardLabel + '</span><a href="' + esc(p.abs_url) + '" target="_blank">' + esc(p.title) + '</a></h2>';
       html += '<button type="button" class="ia-btn ia-share" data-pid="' + escAttr(p.paper_id) + '" onclick="ArxivApp.copyShareLink(this)" title="复制分享链接">';
       html += '<span class="ia-icon" aria-hidden="true">🔗</span><span class="ia-label ia-share-label">分享</span></button>';
       html += '</div>';
       html += '<div class="paper-meta-line">';
+      if (p.featured_authors && p.featured_authors.length) {
+        html += '<span class="badge badge-featured">🌟 ' + esc(p.featured_authors.join(' / ')) + '</span>';
+      }
       if (p.source_categories) p.source_categories.forEach(function (c) { html += '<span class="cat-tag">' + esc(c) + '</span>'; });
       if (gr) {
         html += '<span class="badge badge-grade ' + gr.cls + '">' + gr.emoji + ' ' + esc(gr.label) + '</span>';
@@ -1067,7 +1118,7 @@ var ArxivApp = (function () {
       if (p.abstract) {
         html += '<details class="abstract"><summary>查看摘要</summary><p>' + esc(p.abstract) + '</p></details>';
       }
-      html += paperFiguresBlockHtml(p.paper_id);
+      html += paperFiguresBlockHtml(p);
       if (p.has_analysis) {
         html += '<details class="analysis-section"><summary>📖 查看深度解读</summary>';
         html += '<div class="analysis-content" data-pid="' + p.paper_id + '"></div>';
@@ -1086,13 +1137,46 @@ var ArxivApp = (function () {
     });
     listDiv.innerHTML = html;
     section.appendChild(listDiv);
-    container.appendChild(section);
+    if (opts.prepend) container.insertBefore(section, container.firstChild);
+    else container.appendChild(section);
 
-    extraPapers.forEach(function (p) {
+    items.forEach(function (p) {
       var area = document.getElementById('comments-' + p.paper_id);
       if (area) renderComments(p.paper_id, area, comments[p.paper_id] || []);
     });
     setupPaperFiguresLazyLoad();
+  }
+
+  function renderFeaturedPapers() {
+    renderSpecialPapers(featuredPapers, {
+      containerId: 'featured-papers-container',
+      sectionClass: 'featured-papers-section',
+      headerClass: 'featured-papers-header',
+      iconClass: 'featured-papers-icon',
+      titleClass: 'featured-papers-title',
+      countClass: 'featured-papers-count',
+      icon: '🌟',
+      title: '大佬论文',
+      cardLabel: '大佬',
+      indexClass: 'paper-index-featured',
+      prepend: true,
+    });
+  }
+
+  function renderExtraPapers() {
+    renderSpecialPapers(extraPapers, {
+      containerId: 'extra-papers-container',
+      sectionClass: 'extra-papers-section',
+      headerClass: 'extra-papers-header',
+      iconClass: 'extra-papers-icon',
+      titleClass: 'extra-papers-title',
+      countClass: 'extra-papers-count',
+      icon: '🍱',
+      title: '额外论文解读',
+      cardLabel: '加餐',
+      indexClass: 'paper-index-extra',
+      prepend: false,
+    });
   }
 
   function arxivVersionCacheKey(date, paperId) {
