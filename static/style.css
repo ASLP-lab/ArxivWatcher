@@ -936,6 +936,13 @@ code { font-family: var(--font-mono); font-size: .9em; background: var(--surface
   border: 1px solid rgba(13, 148, 136, 0.25);
   background: rgba(13, 148, 136, 0.08);
 }
+.org-tag-notable { font-weight: 650; }
+.org-tag-ordinary {
+  color: var(--fg-muted) !important;
+  border-color: var(--border);
+  background: var(--surface-subtle);
+  border-radius: var(--radius-sm);
+}
 .badge {
   display: inline-block; font-size: 11px; padding: 2px 8px;
   border-radius: var(--radius-sm); font-weight: 500;
@@ -984,6 +991,14 @@ code { font-family: var(--font-mono); font-size: .9em; background: var(--surface
 }
 
 .paper-authors { color: var(--fg-muted); font-size: 13px; margin-bottom: 4px; }
+.author-corresponding {
+  color: #9a3412;
+  font-weight: 700;
+  text-decoration: underline;
+  text-decoration-color: rgba(234, 88, 12, .35);
+  text-underline-offset: 3px;
+}
+.corresponding-mark { margin-left: 3px; font-size: .9em; }
 .paper-arxiv-comments {
   display: flex;
   flex-wrap: wrap;
@@ -1574,6 +1589,23 @@ code { font-family: var(--font-mono); font-size: .9em; background: var(--surface
 .cookie-option input { width: 20px; height: 20px; accent-color: var(--accent); flex: none; }
 .cookie-option-required { cursor: default; }
 .cookie-settings-actions { justify-content: flex-end; margin-top: 14px; }
+
+.onboarding-overlay { z-index: 2200; }
+.onboarding-card { width: 500px; max-width: calc(100vw - 32px); padding: 34px; }
+.onboarding-progress {
+  color: var(--fg-muted); font: 600 12px var(--font-mono); text-align: right;
+}
+.onboarding-icon { font-size: 48px; line-height: 1; margin: 6px 0 18px; }
+.onboarding-card h2 { margin: 0 0 10px; font-size: 23px; }
+.onboarding-card p { min-height: 72px; margin: 0; color: var(--fg-muted); line-height: 1.75; }
+.onboarding-actions {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 24px;
+}
+.onboarding-skip {
+  border: 0; background: transparent; color: var(--fg-muted); cursor: pointer;
+  padding: 9px 0; font: 500 13px var(--font-ui);
+}
+.onboarding-skip:hover { color: var(--fg); }
 
 @media (max-width: 680px) {
   .cookie-banner { align-items: stretch; flex-direction: column; gap: 14px; padding: 18px; }

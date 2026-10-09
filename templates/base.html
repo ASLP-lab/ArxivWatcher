@@ -107,6 +107,7 @@
         <span class="footer-version">v{{ app_version }}</span>
       </span>
       <button class="footer-cookie-settings" type="button" onclick="openCookieSettings()">Cookie 设置</button>
+      <button class="footer-cookie-settings" type="button" onclick="startOnboarding(true)">新手教程</button>
       {% if icp_beian %}
       <a class="footer-beian" href="https://beian.miit.gov.cn/" target="_blank" rel="noopener noreferrer">{{ icp_beian }}</a>
       {% endif %}
@@ -147,6 +148,21 @@
       {% endif %}
     </div>
     <button class="modal-close" onclick="hideAuthModal()">&times;</button>
+  </div>
+</div>
+
+<!-- First-visit onboarding -->
+<div id="onboarding-modal" class="modal-overlay onboarding-overlay" style="display:none"
+     role="dialog" aria-modal="true" aria-labelledby="onboarding-title">
+  <div class="modal-card onboarding-card">
+    <div class="onboarding-progress" id="onboarding-progress"></div>
+    <div class="onboarding-icon" id="onboarding-icon" aria-hidden="true"></div>
+    <h2 id="onboarding-title"></h2>
+    <p id="onboarding-desc"></p>
+    <div class="onboarding-actions">
+      <button type="button" class="onboarding-skip" onclick="finishOnboarding()">跳过教程</button>
+      <button type="button" class="cookie-btn cookie-btn-primary" id="onboarding-next" onclick="nextOnboardingStep()">下一步</button>
+    </div>
   </div>
 </div>
 
@@ -329,6 +345,7 @@ function persistCookieSettings(geo, login) {
     document.getElementById('cookie-banner').style.display = 'none';
     closeCookieSettings();
     recordTabVisit();
+    maybeStartOnboarding();
     if (!data.consent.login && {{ 'true' if current_user else 'false' }}) location.reload();
   }).catch(function() {
     err.textContent = '设置暂时无法保存，请重试。';
@@ -392,6 +409,48 @@ function recordTabVisit() {
     document.getElementById('cookie-banner').style.display = 'flex';
   }
 })();
+
+/* 首次访问教程：保存在浏览器本地，不依赖登录。 */
+var onboardingStep = 0;
+var onboardingSteps = [
+  {icon:'📚', title:'欢迎使用 ArxivWatcher', desc:'每天的新论文会自动汇总在“今日”，可按领域、评分、点赞和评论快速筛选。'},
+  {icon:'✨', title:'读懂论文卡片', desc:'通讯作者带有信封标记；名校/知名公司与普通单位使用不同标签。展开摘要或深度解读即可阅读。'},
+  {icon:'👍', title:'建立自己的阅读流', desc:'点赞会加入阅读列表；登录后还能收藏、评论和给精读内容画线。你随时可以在页脚重新打开本教程。'}
+];
+function renderOnboardingStep() {
+  var step = onboardingSteps[onboardingStep];
+  if (!step) return;
+  document.getElementById('onboarding-icon').textContent = step.icon;
+  document.getElementById('onboarding-title').textContent = step.title;
+  document.getElementById('onboarding-desc').textContent = step.desc;
+  document.getElementById('onboarding-progress').textContent = (onboardingStep + 1) + ' / ' + onboardingSteps.length;
+  document.getElementById('onboarding-next').textContent = onboardingStep === onboardingSteps.length - 1 ? '开始使用' : '下一步';
+}
+function startOnboarding(force) {
+  if (!force) {
+    try { if (localStorage.getItem('arxiv_onboarding_v1') === 'done') return; } catch (e) {}
+    if (!window.ArxivCookieConsent) return;
+  }
+  onboardingStep = 0;
+  renderOnboardingStep();
+  document.getElementById('onboarding-modal').style.display = 'flex';
+}
+function nextOnboardingStep() {
+  if (onboardingStep < onboardingSteps.length - 1) {
+    onboardingStep += 1;
+    renderOnboardingStep();
+  } else {
+    finishOnboarding();
+  }
+}
+function finishOnboarding() {
+  document.getElementById('onboarding-modal').style.display = 'none';
+  try { localStorage.setItem('arxiv_onboarding_v1', 'done'); } catch (e) {}
+}
+function maybeStartOnboarding() {
+  window.setTimeout(function () { startOnboarding(false); }, 250);
+}
+if (window.ArxivCookieConsent) maybeStartOnboarding();
 
 /* Star prompt */
 function showStarPrompt() {

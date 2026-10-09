@@ -176,6 +176,8 @@ def _lookup(ip: str) -> Optional[dict]:
     country_name = country.names.get("zh-CN") or country.name or code
     if code == "TW" or country_name in ("台湾", "台湾省"):
         country_name = "中国台湾省"
+    if code == "HK":
+        country_name = "中国香港特别行政区"
     subdivision = resp.subdivisions.most_specific
     province_code = subdivision.iso_code if subdivision else None
     province_name = None
@@ -186,6 +188,9 @@ def _lookup(ip: str) -> Optional[dict]:
     if code == "TW":
         province_code = "TW"
         province_name = "中国台湾省"
+    if code == "HK":
+        province_code = "HK"
+        province_name = "香港特别行政区"
     city_name = None
     if resp.city:
         city_name = resp.city.names.get("zh-CN") or resp.city.name
@@ -388,6 +393,24 @@ def _db(db_path: Path):
                             "INSERT INTO geo_stats_meta (key, value) "
                             "VALUES ('city_province_backfill_v1', 'done')"
                         )
+                    hk_done = conn.execute(
+                        "SELECT 1 FROM geo_stats_meta WHERE key = 'hong_kong_region_fix_v1'"
+                    ).fetchone()
+                    if not hk_done:
+                        # 旧版本把香港作为境外国家；迁移为中国省级地区。
+                        conn.execute(
+                            "INSERT INTO geo_region_daily "
+                            "(date, region_key, kind, code, name, visitors) "
+                            "SELECT date, 'CN-HK', 'province', 'HK', '香港特别行政区', visitors "
+                            "FROM geo_region_daily WHERE region_key = 'COUNTRY-HK' "
+                            "ON CONFLICT(date, region_key) DO UPDATE SET "
+                            "visitors = visitors + excluded.visitors, name = excluded.name"
+                        )
+                        conn.execute("DELETE FROM geo_region_daily WHERE region_key = 'COUNTRY-HK'")
+                        conn.execute(
+                            "INSERT INTO geo_stats_meta (key, value) "
+                            "VALUES ('hong_kong_region_fix_v1', 'done')"
+                        )
                 _db_inited = True
     return conn
 
@@ -422,7 +445,7 @@ def record_visit(db_path: Path, ip: str, date_str: Optional[str] = None) -> str:
             "ON CONFLICT(date, code) DO UPDATE SET visitors = visitors + 1",
             (date_str, info["country_code"], info["country_code3"], info["country_name"]),
         )
-        if info["country_code"] in ("CN", "TW"):
+        if info["country_code"] in ("CN", "TW", "HK"):
             province_code = info["province_code"] or "UNKNOWN"
             region_key = f"CN-{province_code}"
             region_code = "" if province_code == "UNKNOWN" else province_code
@@ -491,8 +514,8 @@ def get_stats(db_path: Path, days: int = 7) -> dict:
         "WHERE date >= ? GROUP BY code ORDER BY SUM(visitors) DESC",
         (since,),
     ).fetchall():
-        # 国家层级中台湾地区并入中国；省级层级单独显示“中国台湾省”。
-        if code == "TW":
+        # 国家层级中香港、台湾地区并入中国；省级层级单独显示。
+        if code in ("TW", "HK"):
             code, code3, name = "CN", "CHN", "中国"
         item = country_totals.setdefault(
             code, {"code": code, "code3": code3, "name": name, "visitors": 0}
@@ -522,6 +545,8 @@ def get_stats(db_path: Path, days: int = 7) -> dict:
     ).fetchall():
         if country in ("台湾", "台湾省"):
             country = "中国台湾省"
+        elif country in ("香港", "Hong Kong"):
+            country = "中国香港特别行政区"
         cities.append(
             {"country": country, "name": name, "lat": lat, "lng": lng, "visitors": int(visitors)}
         )

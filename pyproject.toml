@@ -1,6 +1,6 @@
 [project]
 name = "arxivwatcher"
-version = "2.1.0"
+version = "2.2.0"
 description = "ArxivWatcher — arXiv 每日论文监控与精读工具，自动抓取、LLM深度解读、邮件推送"
 readme = "README.md"
 requires-python = ">=3.10"

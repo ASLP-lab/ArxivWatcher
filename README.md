@@ -6,7 +6,7 @@
 
 抓取新论文 · LLM 结构化解读 · Web 浏览 · RSS 订阅 · Zotero 自动导入 · 可选邮件 / 飞书推送
 
-v2.1.0
+v2.2.0
 
 <!-- 徽章占位：按需替换为真实地址 -->
 <!--
@@ -253,6 +253,16 @@ curl -X POST http://127.0.0.1:8091/admin/run-now \
   -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
 
+如果调度器遗留了“正在重试 / 正在筛选”等状态，可按范围清除：
+
+```bash
+# 清除全部状态；scope 也可取 retry 或 classify
+curl -X POST 'http://127.0.0.1:8091/admin/clear-status?scope=all' \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+`scope=retry` 会同时取消尚未开始抓取的 arXiv 更新等待；已经启动的抓取进程不会被终止。
+
 ### 从历史 HTML 重建索引
 
 ```bash
@@ -294,7 +304,7 @@ docker compose pull && docker compose up -d   # 升级
 
 ```bash
 docker build -t aslplab/arxivwatcher:latest .
-docker build -t aslplab/arxivwatcher:2.1.0 .   # 带版本号
+docker build -t aslplab/arxivwatcher:2.2.0 .   # 带版本号
 ```
 
 > **国内构建提示**：若拉基础镜像超时，请先配 Docker 镜像加速器：
@@ -320,14 +330,14 @@ docker login
 
 # 2) 单架构推送
 docker push aslplab/arxivwatcher:latest
-docker push aslplab/arxivwatcher:2.1.0
+docker push aslplab/arxivwatcher:2.2.0
 
 # 3) 多架构（amd64 + arm64）一次性构建并推送，需要 buildx：
 docker buildx create --use --name multiarch
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
   -t aslplab/arxivwatcher:latest \
-  -t aslplab/arxivwatcher:2.1.0 \
+  -t aslplab/arxivwatcher:2.2.0 \
   --push .
 ```
 

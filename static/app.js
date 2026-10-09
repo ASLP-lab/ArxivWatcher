@@ -21,6 +21,7 @@ var ArxivApp = (function () {
   var arxivVersionObserver = null;
   var activeDomainFilter = '';   // 当前选中的领域筛选（主领域名称，空=全部）
   var hideBlacklisted = false;   // 是否隐藏黑名单论文（默认显示但折叠到底部）
+  var hideUnchangedUpdates = false; // 是否隐藏 comments 未变化的 V2+ 更新
   var activeGradeFilter = '';    // 当前选中的推荐等级筛选（must/worth/skip，空=全部）
   var spotlightAuthors = [];     // 重点作者名单（从 /api/highlight-authors 加载）
   var readingListItems = [];     // 当日阅读列表
@@ -149,12 +150,37 @@ var ArxivApp = (function () {
   function renderAuthorsHtml(p) {
     var authors = p.authors || [];
     if (!authors.length) return '';
-    if (paperHasCelebrateAuthor(p)) {
-      return authors.map(function (author) {
-        return '<span class="author-spotlight">' + esc(author) + '</span>';
-      }).join(', ');
-    }
-    return esc(authors.join(', '));
+    var corresponding = (p.corresponding_authors || []).map(normalizeAuthorName);
+    return authors.map(function (author) {
+      var classes = [];
+      var title = '';
+      if (spotlightAuthors.some(function (name) { return authorMatchesHighlight(author, name); })) {
+        classes.push('author-spotlight');
+      }
+      if (corresponding.indexOf(normalizeAuthorName(author)) !== -1) {
+        classes.push('author-corresponding');
+        title = ' title="通讯作者"';
+      }
+      var label = esc(author) + (classes.indexOf('author-corresponding') !== -1
+        ? '<span class="corresponding-mark" aria-label="通讯作者">✉</span>' : '');
+      return classes.length ? '<span class="' + classes.join(' ') + '"' + title + '>' + label + '</span>' : label;
+    }).join(', ');
+  }
+
+  function renderInstitutionsHtml(p) {
+    var notable = p.related_org_titles || [];
+    var detected = (p.org_detection_labels || []).map(normalizeAuthorName);
+    var ordinary = (p.institutions || []).filter(function (org) {
+      var key = normalizeAuthorName(org);
+      return !detected.some(function (known) {
+        return key === known || key.indexOf(known) >= 0 || known.indexOf(key) >= 0;
+      });
+    });
+    if (!notable.length && !ordinary.length) return '';
+    var html = '<div class="org-tag-row">';
+    notable.forEach(function (org) { html += '<span class="org-tag org-tag-notable">' + esc(org) + '</span>'; });
+    ordinary.forEach(function (org) { html += '<span class="org-tag org-tag-ordinary">' + esc(org) + '</span>'; });
+    return html + '</div>';
   }
 
   function celebrateCardDecorHtml() {
@@ -846,6 +872,9 @@ var ArxivApp = (function () {
     if (hideBlacklisted) {
       arr = arr.filter(function (p) { return !p.blacklisted; });
     }
+    if (hideUnchangedUpdates) {
+      arr = arr.filter(function (p) { return !p.comments_unchanged_update; });
+    }
     arr.sort(function (a, b) {
       var primary = 0;
       // 黑名单置底（不论排序方式）
@@ -991,11 +1020,7 @@ var ArxivApp = (function () {
         html += '<div class="innovation-row"><span class="innovation-label">💡 创新</span><span class="innovation-text">' + esc(p.innovation_method) + '</span></div>';
       }
       // Related organization tags
-      if (p.related_org_titles && p.related_org_titles.length) {
-        html += '<div class="org-tag-row">';
-        p.related_org_titles.forEach(function (org) { html += '<span class="org-tag">' + esc(org) + '</span>'; });
-        html += '</div>';
-      }
+      html += renderInstitutionsHtml(p);
       html += '<div class="paper-authors">' + renderAuthorsHtml(p) + '</div>';
       if (p.comments) {
         html += '<div class="paper-arxiv-comments">';
@@ -1059,6 +1084,9 @@ var ArxivApp = (function () {
   function renderSpecialPapers(items, opts) {
     var existing = document.getElementById(opts.containerId);
     if (existing) existing.remove();
+    if (hideUnchangedUpdates) {
+      items = items.filter(function (p) { return !p.comments_unchanged_update; });
+    }
     if (!items.length) return;
     if (appSinglePaperId) return; // 单篇分享页不显示
 
@@ -1104,6 +1132,7 @@ var ArxivApp = (function () {
         var scoreCls = p.score >= 8 ? 'score-high' : (p.score >= 5 ? 'score-mid' : 'score-low');
         html += '<span class="badge badge-score ' + scoreCls + '">⭐ ' + (Math.round(p.score * 10) / 10) + '</span>';
       }
+      html += '<span class="arxiv-version-badge is-pending" aria-hidden="true"></span>';
       html += '</div>';
       html += '</div>';
       if (p.domain_tags && p.domain_tags.length) {
@@ -1114,6 +1143,7 @@ var ArxivApp = (function () {
       if (p.innovation_method) {
         html += '<div class="innovation-row"><span class="innovation-label">💡 创新</span><span class="innovation-text">' + esc(p.innovation_method) + '</span></div>';
       }
+      html += renderInstitutionsHtml(p);
       html += '<div class="paper-authors">' + renderAuthorsHtml(p) + '</div>';
       if (p.abstract) {
         html += '<details class="abstract"><summary>查看摘要</summary><p>' + esc(p.abstract) + '</p></details>';
@@ -1144,6 +1174,7 @@ var ArxivApp = (function () {
       var area = document.getElementById('comments-' + p.paper_id);
       if (area) renderComments(p.paper_id, area, comments[p.paper_id] || []);
     });
+    setupArxivVersionLazyLoad();
     setupPaperFiguresLazyLoad();
   }
 
@@ -1190,20 +1221,23 @@ var ArxivApp = (function () {
     ).then(function (r) {
       return r.json().then(function (d) {
         if (!r.ok || !d.ok) throw new Error((d && d.msg) || 'version ' + r.status);
-        return d.version;
+        return {
+          version: d.version || 1,
+          commentsUnchanged: !!d.comments_unchanged
+        };
       });
     });
   }
 
   function fetchArxivVersion(date, paperId) {
-    if (!date || !paperId) return Promise.resolve(1);
+    if (!date || !paperId) return Promise.resolve({ version: 1, commentsUnchanged: false });
     var key = arxivVersionCacheKey(date, paperId);
     if (arxivVersionCache[key] !== undefined) return Promise.resolve(arxivVersionCache[key]);
     if (arxivVersionInflight[key]) return arxivVersionInflight[key];
-    var p = fetchArxivVersionUncached(date, paperId).then(function (ver) {
-      arxivVersionCache[key] = ver;
+    var p = fetchArxivVersionUncached(date, paperId).then(function (info) {
+      arxivVersionCache[key] = info;
       delete arxivVersionInflight[key];
-      return ver;
+      return info;
     }).catch(function (err) {
       delete arxivVersionInflight[key];
       throw err;
@@ -1232,8 +1266,15 @@ var ArxivApp = (function () {
     var pid = card.dataset.pid;
     if (!appDate || !pid) return;
     card.dataset.arxivVerLoaded = '1';
-    fetchArxivVersion(appDate, pid).then(function (ver) {
-      applyArxivVersionBadge(badge, ver);
+    fetchArxivVersion(appDate, pid).then(function (info) {
+      applyArxivVersionBadge(badge, info.version);
+      var paper = papersById[pid];
+      if (paper && info.version >= 2 && info.commentsUnchanged) {
+        paper.comments_unchanged_update = true;
+        card.classList.add('paper-unchanged-update');
+        if (hideUnchangedUpdates) card.style.display = 'none';
+        refreshUnchangedUpdatesControl();
+      }
     }).catch(function () {
       badge.classList.remove('is-pending');
       badge.classList.add('is-failed');
@@ -1315,6 +1356,21 @@ var ArxivApp = (function () {
     hideBlacklisted = !hideBlacklisted;
     if (btn) btn.classList.toggle('active', hideBlacklisted);
     renderPapers();
+  }
+
+  function toggleUnchangedUpdates(btn) {
+    hideUnchangedUpdates = !hideUnchangedUpdates;
+    if (btn) btn.classList.toggle('active', hideUnchangedUpdates);
+    renderPapers();
+  }
+
+  function refreshUnchangedUpdatesControl() {
+    var btn = document.getElementById('lc-unchanged-btn');
+    if (!btn) return;
+    var count = papers.concat(featuredPapers, extraPapers).filter(function (p) {
+      return p.comments_unchanged_update;
+    }).length;
+    btn.querySelector('.lc-unchanged-count').textContent = count ? ' (' + count + ')' : '';
   }
 
   function expandAll() {
@@ -1682,6 +1738,7 @@ var ArxivApp = (function () {
     setDomainFilter: setDomainFilter,
     setGradeFilter: setGradeFilter,
     toggleBlacklistHide: toggleBlacklistHide,
+    toggleUnchangedUpdates: toggleUnchangedUpdates,
     expandAll: expandAll,
     collapseAll: collapseAll,
     toggleCommunityMarks: toggleCommunityMarks,

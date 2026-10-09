@@ -136,6 +136,7 @@ MAX_TEXT_LENGTH = 80000  # 发送给 LLM 的最大字符数
 CLASSIFY_RETRY_WAIT = 4   # 429 限流后等待秒数
 CLASSIFY_MAX_RETRIES = 3    # 429 最多重试次数
 ORG_SNIPPET_LENGTH = 300
+FIRST_PAGE_MAX_LENGTH = 12000
 ORG_MATCH_MIN_SCORE = 0.84
 ORG_MATCH_MAX_RESULTS = 6
 ORG_GENERIC_TOKENS = {
@@ -199,7 +200,10 @@ class Paper:
     is_cross_list: bool = False    # 是否为跨领域论文
     primary_category: str = ""     # 主分类
     full_text: str = ""
+    first_page_text: str = ""
     analysis: str = ""
+    corresponding_authors: list[str] = field(default_factory=list)
+    institutions: list[str] = field(default_factory=list)
     related_org_titles: list[str] = field(default_factory=list)
     related_org_levels: list[str] = field(default_factory=list)
     org_detection_labels: list[str] = field(default_factory=list)
@@ -970,6 +974,20 @@ def extract_text_from_pdf(pdf_path: Path) -> str:
         return ""
 
 
+def extract_first_page_text(pdf_path: Path) -> str:
+    """提取 PDF 首页完整文本，用于判断通讯作者和作者单位。"""
+    try:
+        reader = PdfReader(str(pdf_path))
+        if not reader.pages:
+            return ""
+        text = reader.pages[0].extract_text() or ""
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return re.sub(r"[ \t]{2,}", " ", text).strip()
+    except Exception as e:
+        log.warning(f"  首页文本提取失败: {e}")
+        return ""
+
+
 # ─────────────────────────────────────────────
 # 步骤 5: LLM 解读 (OpenAI 兼容格式)
 # ─────────────────────────────────────────────
@@ -1655,6 +1673,90 @@ def attach_related_orgs_to_paper(paper: Paper, kb: list[OrgRecord], llm_config: 
     paper.related_org_levels = all_levels
 
 
+def extract_author_and_institution_metadata(
+    paper: Paper,
+    kb: list[OrgRecord],
+    llm_config: LLMConfig,
+) -> None:
+    """让 LLM 仅根据首页判断通讯作者和全部署名单位。
+
+    名校/知名公司仍由本地知识库决定，避免让模型自行评价单位档次。
+    """
+    first_page = (paper.first_page_text or "").strip()
+    if not first_page or not llm_config.api_key:
+        return
+    prompt = (
+        "请从论文首页文本中提取通讯作者和作者所属单位。通讯作者必须有明确的星号、信箱、"
+        "corresponding author 等通讯说明证据；equal contribution 本身不能作为通讯作者证据。"
+        "不确定时返回空列表。"
+        "corresponding_authors 中只能使用给定作者列表里的原始姓名。institutions 应包含首页出现的"
+        "所有大学、研究院、实验室或公司，使用其常用完整名称并去重。只输出 JSON。\n\n"
+        f"作者列表: {json.dumps(paper.authors, ensure_ascii=False)}\n"
+        f"首页文本:\n<first_page>\n{first_page[:FIRST_PAGE_MAX_LENGTH]}\n</first_page>\n\n"
+        '{"corresponding_authors": ["姓名"], "institutions": ["单位"]}'
+    )
+    headers = {"Content-Type": "application/json"}
+    headers["Authorization"] = f"Bearer {llm_config.api_key}"
+    payload = {
+        "model": llm_config.model,
+        "max_tokens": 1024,
+        "temperature": 0.0,
+        "messages": [
+            {"role": "system", "content": "你是严谨的论文首页元数据提取助手，只输出 JSON。"},
+            {"role": "user", "content": prompt},
+        ],
+    }
+    apply_chat_payload_options(payload, llm_config)
+    try:
+        resp = requests.post(
+            llm_config.chat_completions_url,
+            headers=headers,
+            json=payload,
+            timeout=120,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        try:
+            import llm_usage
+            llm_usage.record_usage(data.get("usage"), purpose="paper_metadata")
+        except Exception:
+            pass
+        choices = data.get("choices") or []
+        content = choices[0].get("message", {}).get("content", "") if choices else ""
+        parsed = _extract_json_from_text(content)
+
+        # 只接受作者列表中的姓名；做宽松归一化以兼容标点和大小写差异。
+        author_map = {_normalize_org_text(a): a for a in paper.authors if a}
+        corresponding: list[str] = []
+        for value in parsed.get("corresponding_authors", []):
+            name = author_map.get(_normalize_org_text(str(value)))
+            if name and name not in corresponding:
+                corresponding.append(name)
+        paper.corresponding_authors = corresponding
+
+        institutions: list[str] = []
+        seen: set[str] = set()
+        for value in parsed.get("institutions", []):
+            name = re.sub(r"\s+", " ", str(value)).strip(" ,;.")
+            key = _normalize_org_text(name)
+            if name and key and key not in seen:
+                seen.add(key)
+                institutions.append(name)
+        paper.institutions = institutions[:12]
+
+        matches = match_related_orgs(paper.institutions, kb)
+        paper.org_detection_labels = [rec.name for rec in matches]
+        paper.related_org_titles = [
+            f"{rec.name} ({', '.join(rec.levels)})" if rec.levels else rec.name
+            for rec in matches
+        ]
+        paper.related_org_levels = list(dict.fromkeys(
+            level for rec in matches for level in rec.levels
+        ))
+    except Exception as e:
+        log.warning(f"  首页作者/单位元数据提取失败: {e}")
+
+
 # ─────────────────────────────────────────────
 # 步骤 6: 生成 HTML 报告
 # ─────────────────────────────────────────────
@@ -1686,9 +1788,15 @@ def generate_html_report(
 
     papers_html = ""
     for i, paper in enumerate(papers, 1):
-        authors_str = ", ".join(paper.authors[:5])
-        if len(paper.authors) > 5:
-            authors_str += f" 等 ({len(paper.authors)} 人)"
+        corresponding_keys = {_normalize_org_text(name) for name in paper.corresponding_authors}
+        authors_html = ", ".join(
+            (
+                f'<span class="author-corresponding" title="通讯作者">{_escape_html(author)} ✉</span>'
+                if _normalize_org_text(author) in corresponding_keys
+                else _escape_html(author)
+            )
+            for author in paper.authors
+        )
 
         if skip_llm_analysis:
             analysis_block = ""
@@ -1741,8 +1849,18 @@ def generate_html_report(
         source_tags = "".join(
             f'<span class="cat-tag">{_escape_html(cat)}</span>' for cat in paper.source_categories
         )
+        detected_orgs = {_normalize_org_text(name) for name in paper.org_detection_labels}
+        ordinary_orgs: list[str] = []
+        for name in paper.institutions:
+            key = _normalize_org_text(name)
+            if not any(key == known or key in known or known in key for known in detected_orgs):
+                ordinary_orgs.append(name)
         org_tags = "".join(
-            f'<span class="org-tag">{_escape_html(title)}</span>' for title in paper.related_org_titles
+            f'<span class="org-tag org-tag-notable">{_escape_html(title)}</span>'
+            for title in paper.related_org_titles
+        ) + "".join(
+            f'<span class="org-tag org-tag-ordinary">{_escape_html(title)}</span>'
+            for title in ordinary_orgs
         )
 
         papers_html += f"""
@@ -1760,7 +1878,7 @@ def generate_html_report(
                 <div class="paper-meta">
                     <div class="meta-item">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-                        {_escape_html(authors_str)}
+                        {authors_html}
                     </div>
                     <div class="meta-item">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
@@ -1837,6 +1955,9 @@ def generate_html_report(
   .cat-tag{{display:inline-block;font-family:var(--font-mono);font-size:11px;padding:2px 8px;background:#f0f0ee;border-radius:4px;color:var(--fg-muted)}}
   .org-tags{{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}}
   .org-tag{{display:inline-block;font-size:11px;padding:2px 8px;background:#ecfeff;border-radius:999px;color:#0f766e;border:1px solid #99f6e4}}
+  .org-tag-notable{{font-weight:700}}
+  .org-tag-ordinary{{color:var(--fg-muted);background:#f8fafc;border-color:var(--border);border-radius:4px}}
+  .author-corresponding{{color:#9a3412;font-weight:700;text-decoration:underline;text-underline-offset:3px}}
   .paper-title{{font-size:20px;font-weight:700;line-height:1.4;margin-bottom:12px}}
   .paper-title a{{color:inherit;text-decoration:none;border-bottom:2px solid transparent;transition:border-color .2s}}
   .paper-title a:hover{{border-color:var(--accent)}}
@@ -1954,12 +2075,14 @@ def export_papers_json(
     for p in papers:
         record = asdict(p)
         record.pop("full_text", None)
+        record.pop("first_page_text", None)
         paper_records.append(record)
 
     featured_records = []
     for p in featured_papers or []:
         record = asdict(p)
         record.pop("full_text", None)
+        record.pop("first_page_text", None)
         featured_records.append(record)
 
     payload = {
@@ -2053,11 +2176,6 @@ def _process_paper_llm_pipeline(
     pdf_dir: Path,
 ) -> None:
     """下载 PDF 并对单篇论文执行 LLM 解读与筛选（可并发调用）。"""
-    if org_kb and llm_config.api_key:
-        attach_related_orgs_to_paper(paper, org_kb, llm_config)
-        if paper.related_org_titles:
-            log.info(f"  [{paper.paper_id}] 相关单位: {', '.join(paper.related_org_titles)}")
-
     pdf_path = download_pdf(paper, pdf_dir)
     time.sleep(REQUEST_DELAY)
 
@@ -2067,10 +2185,11 @@ def _process_paper_llm_pipeline(
         return
 
     paper.full_text = extract_text_from_pdf(pdf_path)
+    paper.first_page_text = extract_first_page_text(pdf_path)
     if not paper.full_text.strip():
         log.warning(f"  [{paper.paper_id}] 文本提取为空，将使用摘要")
-    elif org_kb and llm_config.api_key:
-        attach_related_orgs_to_paper(paper, org_kb, llm_config)
+    if llm_config.api_key:
+        extract_author_and_institution_metadata(paper, org_kb, llm_config)
 
     paper.analysis = analyze_paper_with_llm(paper, llm_config)
 
@@ -2228,6 +2347,9 @@ def _retry_one_paper(
         else:
             log.warning(f"  [{paper.paper_id}] 文本提取为空，将使用摘要")
 
+        paper.first_page_text = extract_first_page_text(pdf_path)
+        extract_author_and_institution_metadata(paper, org_kb, llm_config)
+
         new_analysis = analyze_paper_with_llm(paper, llm_config)
         if new_analysis and not new_analysis.startswith("[LLM") and not new_analysis.startswith("[PDF"):
             paper.analysis = new_analysis
@@ -2351,7 +2473,7 @@ def retry_failed_from_json(
             continue
         paper = updated[pid]
         for fname in allowed_fields:
-            if fname == "full_text":
+            if fname in {"full_text", "first_page_text"}:
                 continue
             rec[fname] = getattr(paper, fname)
 
@@ -2400,16 +2522,12 @@ def _process_extra_paper_input(
 
     part["fetched"] = 1
 
-    try:
-        if org_kb and llm_config.api_key:
-            attach_related_orgs_to_paper(paper, org_kb, llm_config)
-    except Exception:
-        pass
-
     pdf_path = download_pdf(paper, pdf_dir)
     time.sleep(REQUEST_DELAY)
     if pdf_path:
         paper.full_text = extract_text_from_pdf(pdf_path)
+        paper.first_page_text = extract_first_page_text(pdf_path)
+        extract_author_and_institution_metadata(paper, org_kb, llm_config)
 
     analysis = analyze_paper_with_llm(paper, llm_config)
     if analysis and not analysis.startswith("[LLM") and not analysis.startswith("[PDF"):
@@ -2427,6 +2545,7 @@ def _process_extra_paper_input(
 
     record = asdict(paper)
     record.pop("full_text", None)
+    record.pop("first_page_text", None)
     return record, part, paper
 
 

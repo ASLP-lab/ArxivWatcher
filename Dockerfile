@@ -38,7 +38,7 @@ RUN python -m venv /opt/venv \
 FROM python:${PYTHON_VERSION}-slim AS runtime
 
 LABEL org.opencontainers.image.title="ArxivWatcher" \
-      org.opencontainers.image.version="2.1.0" \
+      org.opencontainers.image.version="2.2.0" \
       org.opencontainers.image.description="arXiv 每日论文监控与精读工具（Web + 定时调度）" \
       org.opencontainers.image.source="https://github.com/ASLP-lab/ArxivWatcher" \
       org.opencontainers.image.url="https://hub.docker.com/r/aslplab/arxivwatcher" \

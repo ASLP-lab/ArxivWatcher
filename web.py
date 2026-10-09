@@ -133,6 +133,7 @@ DATA_DIR = ROOT / "data" / "papers"
 BACKGROUND_LOCK_FILE = DATA_ROOT / ".web_background.lock"
 SCHEDULER_STATUS_FILE = DATA_ROOT / "scheduler_status.json"
 SCHEDULER_TRIGGER_FILE = DATA_ROOT / "scheduler_trigger.json"
+SCHEDULER_CANCEL_FILE = DATA_ROOT / "scheduler_cancel.json"
 CLASSIFY_STATE_FILE = DATA_ROOT / "classify_state.json"
 CLASSIFY_LOCK_FILE = DATA_ROOT / ".classify.lock"
 REPORTS_DIR = ROOT / "reports"
@@ -2305,8 +2306,11 @@ def api_arxiv_version(date: str, paper_id: str):
     base_id = arxiv_version.normalize_base_id(paper_id)
     if not arxiv_version.is_arxiv_base_id(base_id):
         return jsonify({"ok": False, "msg": "无效的 arXiv ID"}), 400
+    target = _find_paper(load_index(date) or {}, paper_id) or {}
     try:
-        ver, from_cache = _arxiv_version_cache.get_version(date, paper_id)
+        info, from_cache = _arxiv_version_cache.get_version_info(
+            date, paper_id, str(target.get("comments") or "")
+        )
     except Exception as exc:
         log.warning(
             "arxiv version fetch failed for %s: %s",
@@ -2317,7 +2321,8 @@ def api_arxiv_version(date: str, paper_id: str):
     resp = make_response(
         jsonify({
             "ok": True,
-            "version": ver,
+            "version": int(info.get("version", 1)),
+            "comments_unchanged": bool(info.get("comments_unchanged", False)),
             "date": date,
             "paper_id": paper_id,
             "cached": from_cache,
@@ -3331,6 +3336,12 @@ def _enqueue_scheduler_run(reason: str = "manual") -> None:
 def _start_scheduler_trigger_watcher() -> None:
     def watch() -> None:
         while True:
+            if _scheduler and SCHEDULER_CANCEL_FILE.is_file():
+                try:
+                    SCHEDULER_CANCEL_FILE.unlink(missing_ok=True)
+                    _scheduler.cancel_pending_retry()
+                except Exception as e:
+                    log.warning("处理 scheduler 取消请求失败: %s", e)
             if _scheduler and SCHEDULER_TRIGGER_FILE.is_file():
                 try:
                     raw = SCHEDULER_TRIGGER_FILE.read_text(encoding="utf-8")
@@ -3491,6 +3502,7 @@ class DailyScheduler(threading.Thread):
         self.max_attempts = max_attempts
         self.retry_seconds = retry_seconds
         self._stop_event = threading.Event()
+        self._cancel_retry_event = threading.Event()
         self._running_lock = threading.Lock()
         self.freshness_wait: Optional[dict] = None
         self.last_run: Optional[datetime] = None
@@ -3557,6 +3569,7 @@ class DailyScheduler(threading.Thread):
     def _wait_until_fresh_or_retry_exhausted(self, reason: str) -> bool:
         if reason != "scheduled":
             return True
+        self._cancel_retry_event.clear()
         self.freshness_wait = None
         for attempt in range(1, self.max_attempts + 1):
             ready, stale_categories = self._check_categories_are_today()
@@ -3581,7 +3594,7 @@ class DailyScheduler(threading.Thread):
             if attempt >= self.max_attempts:
                 break
             remaining = self.retry_seconds
-            while remaining > 0 and not self._stop_event.is_set():
+            while remaining > 0 and not self._stop_event.is_set() and not self._cancel_retry_event.is_set():
                 self.freshness_wait = {
                     "attempt": attempt,
                     "max_attempts": self.max_attempts,
@@ -3595,6 +3608,11 @@ class DailyScheduler(threading.Thread):
                 remaining -= step
             if self._stop_event.is_set():
                 self.freshness_wait = None
+                return False
+            if self._cancel_retry_event.is_set():
+                self.freshness_wait = None
+                self.last_status = ""
+                _persist_scheduler_status(self)
                 return False
         self.freshness_wait = None
         fail_msg = (
@@ -3705,6 +3723,13 @@ class DailyScheduler(threading.Thread):
     def stop(self) -> None:
         self._stop_event.set()
 
+    def cancel_pending_retry(self) -> None:
+        """取消等待 arXiv 更新的重试；不会终止已经启动的抓取子进程。"""
+        self._cancel_retry_event.set()
+        self.freshness_wait = None
+        self.last_status = ""
+        _persist_scheduler_status(self)
+
 
 @app.route("/admin/run-now", methods=["POST"])
 def admin_run_now():
@@ -3719,6 +3744,41 @@ def admin_run_now():
         target=_scheduler.run_once, kwargs={"reason": "manual"}, daemon=True
     ).start()
     return {"ok": True, "msg": "已触发，可在日志中查看进度"}
+
+
+@app.route("/admin/clear-status", methods=["POST"])
+def admin_clear_status():
+    """清除重试/筛选等持久化状态，供运维 curl 调用。"""
+    auth_error = _admin_auth_error()
+    if auth_error:
+        return auth_error
+    scope = str(request.args.get("scope") or "all").strip().lower()
+    if scope not in {"all", "retry", "classify"}:
+        return jsonify({"ok": False, "msg": "scope must be all, retry, or classify"}), 400
+
+    cleared: list[str] = []
+    if scope in {"all", "retry"}:
+        if _scheduler:
+            _scheduler.cancel_pending_retry()
+        else:
+            DATA_ROOT.mkdir(parents=True, exist_ok=True)
+            SCHEDULER_CANCEL_FILE.write_text(
+                json.dumps({"requested_at": datetime.now(BJ_TZ).isoformat()}),
+                encoding="utf-8",
+            )
+            snapshot = _load_scheduler_status()
+            snapshot.update({"freshness_wait": None, "last_status": "", "main_running": False})
+            SCHEDULER_STATUS_FILE.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+        cleared.append("retry")
+    if scope in {"all", "classify"}:
+        # 这里只清除遗留的展示状态；持有任务锁的真实后台任务不被强杀。
+        snapshot = _get_classify_state_snapshot()
+        snapshot.update({"running": False, "last_status": None, "task_type": None})
+        snapshot["progress"] = {"current": 0, "total": 0, "percent": 0, "bar": "", "paper_id": "", "title": ""}
+        _classify_state.update(snapshot)
+        _save_classify_state()
+        cleared.append("classify")
+    return jsonify({"ok": True, "cleared": cleared})
 
 
 _classify_state: dict = {
