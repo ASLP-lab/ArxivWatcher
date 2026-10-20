@@ -50,6 +50,8 @@ services:
 
       # ── 对外访问地址（飞书消息、Zotero xpi 会用到）──
       WEB_PUBLIC_URL: http://127.0.0.1:8091
+      # 多个飞书机器人可用逗号分隔；旧的 FEISHU_WEBHOOK_URL 仍兼容
+      # FEISHU_WEBHOOK_URLS: "https://open.feishu.cn/open-apis/bot/v2/hook/aaa,https://open.feishu.cn/open-apis/bot/v2/hook/bbb"
 
       # ── LDAP（如启用 ldap 认证方式，取消注释并填好）──
       # LDAP_URI: ldap://ldap.example.com

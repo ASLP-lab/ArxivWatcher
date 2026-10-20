@@ -6,7 +6,7 @@
 
 抓取新论文 · LLM 结构化解读 · Web 浏览 · RSS 订阅 · Zotero 自动导入 · 可选邮件 / 飞书推送
 
-v2.2.0
+v2.3.0
 
 <!-- 徽章占位：按需替换为真实地址 -->
 <!--
@@ -66,7 +66,7 @@ ArxivWatcher 帮你把"每天刷 arXiv"这件事自动化：
 | **Web 浏览** | Flask 界面：按日期浏览、关键词搜索、访问统计；论文卡片动态渲染，支持按 **点赞数 / 评论数 / 原始序号** 排序，一键展开/折叠全部解读 |
 | **互动与收藏** | 注册登录后可点赞/点踩、评论、收藏（可分文件夹），并在深度解读中做 **Zotero 同款多色标记**；提供「我的收藏」「我的标记」页面 |
 | **实验室动态** | 每小时抓取 [ASLP 实验室](http://www.npu-aslp.org) 新闻/公告并缓存，论文页顶部展示最近 5 条 |
-| **RSS 订阅** | `/rss` 配置页与 `/rss/feed.xml` 输出 |
+| **RSS 订阅** | `/rss` 配置页与 `/rss/feed.xml` 输出；与飞书共用每日综述，每天仅生成一个 RSS 条目 |
 | **Zotero 插件** | 自动把每日报告 HTML 导入为本地网页快照 |
 | **可插拔存储** | 互动/评论/标记/收藏/用户/访问数据支持 **JSON 文件或 SQLite** 后端，附带双向转换工具 |
 | **可选推送** | SMTP 邮件、飞书群机器人 |
@@ -137,7 +137,8 @@ bash start_web.sh
 | `STORAGE_BACKEND` | 存储后端：`json`（默认）/ `sqlite`（Docker 默认） |
 | `SQLITE_PATH` | SQLite 数据库路径，默认 `data/app.db` |
 | `SMTP_*` / `EMAIL_TO` | 邮件推送（可选） |
-| `FEISHU_WEBHOOK_URL` | 飞书机器人（可选） |
+| `FEISHU_WEBHOOK_URLS` | 多个飞书机器人 webhook（可选，支持逗号、分号、空白或 JSON 数组） |
+| `FEISHU_WEBHOOK_URL` | 单个飞书机器人 webhook（兼容旧配置） |
 | `WEB_PUBLIC_URL` | 对外访问地址（用于插件 xpi、飞书链接） |
 | `ARXIVWATCHER_CONFIG_DIR` | 本地配置目录，默认 `./config`（Docker 为 `/app/config`） |
 
@@ -304,7 +305,14 @@ docker compose pull && docker compose up -d   # 升级
 
 ```bash
 docker build -t aslplab/arxivwatcher:latest .
-docker build -t aslplab/arxivwatcher:2.2.0 .   # 带版本号
+docker build -t aslplab/arxivwatcher:2.3.0 .   # 带版本号
+```
+
+构建时会检测出口 IP：中国大陆自动使用中科大 PyPI 镜像，其他地区或检测失败时使用官方 PyPI。也可以手动指定：
+
+```bash
+docker build --build-arg PIP_SOURCE=ustc -t aslplab/arxivwatcher:2.3.0 .     # 强制中科大源
+docker build --build-arg PIP_SOURCE=official -t aslplab/arxivwatcher:2.3.0 . # 强制官方源
 ```
 
 > **国内构建提示**：若拉基础镜像超时，请先配 Docker 镜像加速器：
@@ -320,7 +328,7 @@ docker build -t aslplab/arxivwatcher:2.2.0 .   # 带版本号
 > EOF
 > sudo systemctl restart docker
 > ```
-> Dockerfile 构建期 pip 已默认走清华源，无需额外处理。
+> `PIP_SOURCE` 默认值为 `auto`，可选值为 `auto`、`ustc`、`official`。
 
 ### 推送到 Docker Hub
 
@@ -330,14 +338,14 @@ docker login
 
 # 2) 单架构推送
 docker push aslplab/arxivwatcher:latest
-docker push aslplab/arxivwatcher:2.2.0
+docker push aslplab/arxivwatcher:2.3.0
 
 # 3) 多架构（amd64 + arm64）一次性构建并推送，需要 buildx：
 docker buildx create --use --name multiarch
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
   -t aslplab/arxivwatcher:latest \
-  -t aslplab/arxivwatcher:2.2.0 \
+  -t aslplab/arxivwatcher:2.3.0 \
   --push .
 ```
 
@@ -476,7 +484,8 @@ MaxMind 要求 GeoLite 数据保持更新，建议按其[官方更新说明](htt
 
 | 变量 | 默认值 | 说明 |
 |------|------|------|
-| `FEISHU_WEBHOOK_URL` | 空 | 飞书群机器人 webhook。设置后每日抓取完成会推送一条汇总消息 |
+| `FEISHU_WEBHOOK_URLS` | 空 | 多个飞书群机器人 webhook；支持逗号、分号、空白分隔或 JSON 数组，向每个机器人发送同一条每日综述 |
+| `FEISHU_WEBHOOK_URL` | 空 | 单个飞书群机器人 webhook，兼容旧配置；可与复数变量同时使用并自动去重 |
 
 #### 缓存策略（可选，一般不用动）
 
@@ -537,7 +546,7 @@ docker run -d --name arxivwatcher \
   -e LLM_BASE_URL=https://api.deepseek.com/v1 \
   -e LLM_MODEL=deepseek-chat \
   -e LLM_API_KEY=sk-xxxx \
-  -e FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/xxxx \
+  -e 'FEISHU_WEBHOOK_URLS=https://open.feishu.cn/open-apis/bot/v2/hook/aaa,https://open.feishu.cn/open-apis/bot/v2/hook/bbb' \
   \
   --restart unless-stopped \
   aslplab/arxivwatcher:latest

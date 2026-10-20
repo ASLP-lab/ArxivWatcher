@@ -399,15 +399,77 @@ def get_daily_digest(date_str: str) -> Optional[dict]:
     return store.get(date_str)
 
 
-def get_recent_digests(limit: int = 10) -> list[dict]:
-    """获取最近若干天的综述列表（按日期倒序）。"""
+def _snapshot_fallback_digest(path: Path, category: str = "") -> Optional[dict]:
+    """从论文快照生成单条每日总览，确保 RSS 永不退回逐篇刷屏。"""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    date_str = str(payload.get("date") or path.stem)
+    categories = [str(x) for x in (payload.get("categories") or []) if x]
+    papers: list[dict] = []
+    for collection in ("featured_papers", "papers", "extra_papers"):
+        for paper in payload.get(collection) or []:
+            if not isinstance(paper, dict):
+                continue
+            source_categories = paper.get("source_categories") or []
+            if category and category not in source_categories and category != paper.get("primary_category"):
+                continue
+            papers.append(paper)
+    if category and not papers:
+        return None
+    cat_text = " / ".join(([category] if category else categories)) or "未分类"
+    lines = [
+        f"日期: {date_str}",
+        f"分类: {cat_text}",
+        f"论文总数: {len(papers)}",
+        "",
+        "今日论文总览",
+    ]
+    for index, paper in enumerate(papers[:30], 1):
+        title = str(paper.get("title") or paper.get("paper_id") or "未命名论文")
+        authors = [str(x) for x in (paper.get("authors") or []) if x]
+        author_text = "、".join(authors[:3])
+        if len(authors) > 3:
+            author_text += " 等"
+        lines.append(f"[{index}] {title}" + (f" — {author_text}" if author_text else ""))
+    if len(papers) > 30:
+        lines.append(f"……另有 {len(papers) - 30} 篇，请打开当日报告查看。")
+    return {
+        "date": date_str,
+        "text": "\n".join(lines),
+        "generated_at": str(payload.get("generated_at") or ""),
+        "categories": [category] if category else categories,
+        "paper_count": len(papers),
+        "featured_count": len(payload.get("featured_papers") or []),
+        "fallback": True,
+    }
+
+
+def get_recent_digests(limit: int = 10, category: str = "") -> list[dict]:
+    """获取最近每日综述；缺少 LLM 综述时按日期生成一条快照总览。"""
     store = _make_digest_store()
     all_data = store.all()
-    items = []
+    by_date: dict[str, dict] = {}
     for date_str, record in all_data.items():
         if not isinstance(record, dict):
             continue
-        items.append({"date": date_str, **record})
+        categories = [str(x) for x in (record.get("categories") or []) if x]
+        if category and category not in categories:
+            continue
+        if record.get("text"):
+            by_date[date_str] = {"date": date_str, **record}
+
+    # 历史部署可能只有 papers JSON、没有 daily_digests；每个日期只补一条总览。
+    for path in DATA_DIR.glob("*.json"):
+        date_str = path.stem
+        if date_str in by_date:
+            continue
+        fallback = _snapshot_fallback_digest(path, category=category)
+        if fallback:
+            by_date[date_str] = fallback
+
+    items = list(by_date.values())
     items.sort(key=lambda x: x.get("date", ""), reverse=True)
     return items[:limit]
 

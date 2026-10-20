@@ -711,6 +711,7 @@ code { font-family: var(--font-mono); font-size: .9em; background: var(--surface
   word-break: break-all;
   line-height: 1.45;
 }
+.rss-digest-text { white-space: pre-wrap; line-height: 1.65; }
 
 /* ── Zotero 插件页 ── */
 .plugin-hero {

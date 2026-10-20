@@ -20,7 +20,8 @@
   ARXIV_CHECK_CATEGORIES  开跑前检查是否已更新到今天的分类（空格分隔）
   ADMIN_TOKEN   /admin/* 管理接口的 Bearer token
   WEB_PUBLIC_URL  对外暴露的访问地址，注入到 run.sh 进程供飞书消息使用
-  FEISHU_WEBHOOK_URL  飞书 webhook，注入到 run.sh 进程
+  FEISHU_WEBHOOK_URLS 多个飞书 webhook（逗号、分号、空白或 JSON 数组分隔）
+  FEISHU_WEBHOOK_URL  单个飞书 webhook（兼容旧配置）
   ICP_BEIAN       ICP 备案号（可选）；未设置时页脚不显示备案链接
   STATIC_CACHE_SECONDS       /static/_h/* 哈希静态资源浏览器与 CDN 缓存秒数，默认 31536000（1 年）
   IMMUTABLE_CACHE_SECONDS    带 ETag 的不可变内容浏览器缓存秒数，默认 86400（1 天）
@@ -96,6 +97,7 @@ import mcp_server
 import paper_assets
 import highlight_authors
 import llm_usage
+from feishu_webhooks import configured_webhook_urls, parse_webhook_urls
 
 ROOT = Path(__file__).resolve().parent
 
@@ -3018,18 +3020,18 @@ def search():
 def rss_page():
     cat = request.args.get("cat", "").strip()
     try:
-        limit = max(1, min(int(request.args.get("limit", "80")), 200))
+        limit = max(1, min(int(request.args.get("limit", "30")), 90))
     except ValueError:
-        limit = 80
+        limit = 30
     categories = list_all_categories()
-    papers = collect_recent_papers(category=cat, limit=limit)
+    digests = daily_digest.get_recent_digests(limit=limit, category=cat)
     feed_url = url_for("rss_feed", _external=True, **({"cat": cat} if cat else {}), limit=limit)
     return render_template(
         "rss.html",
         cat=cat,
         limit=limit,
         categories=categories,
-        papers=papers,
+        digests=digests,
         feed_url=feed_url,
     )
 
@@ -3040,17 +3042,11 @@ def rss_feed():
         limit = max(1, min(int(request.args.get("limit", "30")), 90))
     except ValueError:
         limit = 30
-    digests = daily_digest.get_recent_digests(limit=limit)
-    if digests:
-        xml_text = build_digest_rss_xml(
-            base_url=request.host_url.rstrip("/"), digests=digests,
-        )
-    else:
-        cat = request.args.get("cat", "").strip()
-        papers = collect_recent_papers(category=cat, limit=80)
-        xml_text = build_rss_xml(
-            base_url=request.host_url.rstrip("/"), papers=papers, category=cat,
-        )
+    cat = request.args.get("cat", "").strip()
+    digests = daily_digest.get_recent_digests(limit=limit, category=cat)
+    xml_text = build_digest_rss_xml(
+        base_url=request.host_url.rstrip("/"), digests=digests,
+    )
     return Response(xml_text, mimetype="application/rss+xml; charset=utf-8")
 
 
@@ -3430,14 +3426,14 @@ def init_background_services() -> None:
         minute = int(os.environ.get("DAILY_MINUTE", "0"))
         run_script = Path(os.environ.get("RUN_SCRIPT", str(ROOT / "run.sh"))).resolve()
         categories = os.environ.get("ARXIV_CHECK_CATEGORIES", "eess.AS cs.SD").split()
-        feishu_webhook_url = os.environ.get("FEISHU_WEBHOOK_URL", "")
+        feishu_webhook_urls = configured_webhook_urls()
 
         _scheduler = DailyScheduler(
             hour=hour,
             minute=minute,
             run_script=run_script,
             categories=categories,
-            feishu_webhook_url=feishu_webhook_url,
+            feishu_webhook_url=feishu_webhook_urls,
         )
         _scheduler.start()
         _persist_scheduler_status(_scheduler)
@@ -3489,7 +3485,7 @@ class DailyScheduler(threading.Thread):
         minute: int,
         run_script: Path,
         categories: list[str],
-        feishu_webhook_url: str,
+        feishu_webhook_url: list[str] | str,
         max_attempts: int = FRESHNESS_MAX_ATTEMPTS,
         retry_seconds: int = FRESHNESS_RETRY_SECONDS,
     ):
@@ -3498,7 +3494,7 @@ class DailyScheduler(threading.Thread):
         self.minute = minute
         self.run_script = run_script
         self.categories = categories
-        self.feishu_webhook_url = feishu_webhook_url.strip()
+        self.feishu_webhook_urls = parse_webhook_urls(feishu_webhook_url)
         self.max_attempts = max_attempts
         self.retry_seconds = retry_seconds
         self._stop_event = threading.Event()
@@ -3554,17 +3550,21 @@ class DailyScheduler(threading.Thread):
         return len(stale_categories) == 0, stale_categories
 
     def _send_feishu_text(self, text: str) -> None:
-        if not self.feishu_webhook_url:
+        if not self.feishu_webhook_urls:
             return
         payload = {"msg_type": "text", "content": {"text": text}}
-        try:
-            resp = requests.post(self.feishu_webhook_url, json=payload, timeout=10)
-            resp.raise_for_status()
-            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
-            if data.get("code", 0) != 0 or data.get("StatusCode", 0) != 0:
-                log.warning(f"飞书提醒返回异常: {data}")
-        except Exception as e:
-            log.warning(f"飞书提醒发送失败: {e}")
+        for index, webhook_url in enumerate(self.feishu_webhook_urls, 1):
+            try:
+                resp = requests.post(webhook_url, json=payload, timeout=10)
+                resp.raise_for_status()
+                data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+                if data.get("code", 0) != 0 or data.get("StatusCode", 0) != 0:
+                    log.warning("飞书机器人 %d/%d 提醒返回异常: %s", index, len(self.feishu_webhook_urls), data)
+            except Exception as e:
+                log.warning(
+                    "飞书机器人 %d/%d 提醒发送失败: %s",
+                    index, len(self.feishu_webhook_urls), type(e).__name__,
+                )
 
     def _wait_until_fresh_or_retry_exhausted(self, reason: str) -> bool:
         if reason != "scheduled":

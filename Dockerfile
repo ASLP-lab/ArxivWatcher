@@ -1,5 +1,5 @@
 # =============================================================================
-# ArxivWatcher — 多阶段 Dockerfile（国内友好，无 syntax 头、无外网 ADD）
+# ArxivWatcher — 多阶段 Dockerfile（自动选择 pip 源，无 syntax 头、无外网 ADD）
 #   阶段 1: builder  —— pip 在 /opt/venv 装好所有依赖
 #   阶段 2: runtime  —— 精简运行镜像（非 root、Asia/Shanghai 时区）
 # 注意：第一行不要写 "# syntax=..."，否则 BuildKit 会去拉 docker/dockerfile 镜像，
@@ -16,10 +16,11 @@ FROM python:${PYTHON_VERSION}-slim AS builder
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    # 构建期走国内 pip 源，避免 PyPI 拉不动
-    PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
-    PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# auto: 中国大陆出口 IP 使用中科大源，其他地区或检测失败时使用官方 PyPI。
+# 也可通过 --build-arg PIP_SOURCE=ustc|official 手动指定。
+ARG PIP_SOURCE=auto
 
 WORKDIR /app
 
@@ -27,7 +28,19 @@ WORKDIR /app
 COPY pyproject.toml requirements.txt ./
 
 # 建 venv 并安装依赖；额外补 brotli/ldap3（pyproject 里有，requirements 没列全）
-RUN python -m venv /opt/venv \
+RUN set -eu; \
+    pip_source="${PIP_SOURCE}"; \
+    if [ "${pip_source}" = "auto" ]; then \
+        country="$(python -c 'import urllib.request; data = urllib.request.urlopen("https://www.cloudflare.com/cdn-cgi/trace", timeout=5).read().decode(); print(next((line[4:] for line in data.splitlines() if line.startswith("loc=")), ""))' 2>/dev/null || true)"; \
+        if [ "${country}" = "CN" ]; then pip_source=ustc; else pip_source=official; fi; \
+    fi; \
+    case "${pip_source}" in \
+        ustc) export PIP_INDEX_URL=https://pypi.mirrors.ustc.edu.cn/simple PIP_TRUSTED_HOST=pypi.mirrors.ustc.edu.cn ;; \
+        official) export PIP_INDEX_URL=https://pypi.org/simple ;; \
+        *) echo "Invalid PIP_SOURCE=${pip_source}; expected auto, ustc, or official" >&2; exit 2 ;; \
+    esac; \
+    echo "Using pip source: ${pip_source} (${PIP_INDEX_URL})"; \
+    python -m venv /opt/venv \
     && /opt/venv/bin/pip install --upgrade pip \
     && /opt/venv/bin/pip install -r requirements.txt \
     && /opt/venv/bin/pip install brotli ldap3 bcrypt markdown
@@ -38,7 +51,7 @@ RUN python -m venv /opt/venv \
 FROM python:${PYTHON_VERSION}-slim AS runtime
 
 LABEL org.opencontainers.image.title="ArxivWatcher" \
-      org.opencontainers.image.version="2.2.0" \
+      org.opencontainers.image.version="2.3.0" \
       org.opencontainers.image.description="arXiv 每日论文监控与精读工具（Web + 定时调度）" \
       org.opencontainers.image.source="https://github.com/ASLP-lab/ArxivWatcher" \
       org.opencontainers.image.url="https://hub.docker.com/r/aslplab/arxivwatcher" \

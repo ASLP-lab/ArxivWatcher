@@ -78,6 +78,7 @@ from pypdf import PdfReader
 import markdown
 
 from fetch_author_papers import ArxivAPIError, fetch_author_papers
+from feishu_webhooks import configured_webhook_urls, parse_webhook_urls
 
 from daily_digest import generate_daily_digest, generate_digest_from_json
 
@@ -2705,17 +2706,76 @@ def _feishu_response_ok(data: dict) -> bool:
     return True
 
 
+def _safe_feishu_error(error: Exception) -> str:
+    """避免异常字符串把包含机器人密钥的完整 webhook 写入日志。"""
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None)
+    return f"HTTP {status}" if status else type(error).__name__
+
+
+def _send_feishu_payload_to_webhooks(
+    json_payload: str,
+    headers: dict[str, str],
+    webhook_urls: list[str],
+    *,
+    label: str,
+) -> None:
+    """向全部机器人发送同一消息；单个失败不阻塞其他机器人。"""
+    failures: list[str] = []
+    log.info("发送%s到 %d 个飞书机器人...", label, len(webhook_urls))
+    for index, webhook_url in enumerate(webhook_urls, 1):
+        last_err: Optional[Exception] = None
+        for attempt in range(1, FEISHU_MAX_RETRIES + 1):
+            try:
+                resp = requests.post(
+                    webhook_url,
+                    data=json_payload,
+                    headers=headers,
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                data = (
+                    resp.json()
+                    if resp.headers.get("content-type", "").startswith("application/json")
+                    else {}
+                )
+                if not _feishu_response_ok(data):
+                    raise RuntimeError(f"飞书返回非成功状态: {data}")
+                log.info("飞书机器人 %d/%d 发送成功", index, len(webhook_urls))
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < FEISHU_MAX_RETRIES:
+                    delay = random.uniform(2, 10)
+                    log.warning(
+                        "飞书机器人 %d/%d 发送失败 (第 %d/%d 次): %s，%.1fs 后重试",
+                        index, len(webhook_urls), attempt, FEISHU_MAX_RETRIES,
+                        _safe_feishu_error(e), delay,
+                    )
+                    time.sleep(delay)
+        if last_err is not None:
+            failures.append(f"机器人 {index}: {_safe_feishu_error(last_err)}")
+            log.error(
+                "飞书机器人 %d/%d 最终发送失败: %s",
+                index, len(webhook_urls), _safe_feishu_error(last_err),
+            )
+    if failures:
+        raise RuntimeError(f"{len(failures)}/{len(webhook_urls)} 个飞书机器人发送失败")
+
+
 def send_feishu_message(
     papers: list[Paper],
     categories: list[str],
     date_str: str,
-    webhook_url: str,
+    webhook_url: str | list[str],
     public_url: str = "",
     max_titles: int = 100,
 ) -> None:
     """向飞书群机器人 webhook 发送一条文本汇总消息。"""
-    if not webhook_url:
-        log.info("未设置 FEISHU_WEBHOOK_URL，跳过飞书推送")
+    webhook_urls = parse_webhook_urls(webhook_url)
+    if not webhook_urls:
+        log.info("未设置 FEISHU_WEBHOOK_URLS / FEISHU_WEBHOOK_URL，跳过飞书推送")
         return
 
     cat_str = " / ".join(categories)
@@ -2745,42 +2805,10 @@ def send_feishu_message(
     json_payload = json.dumps(payload, ensure_ascii=False)
     headers = {"Content-Type": "application/json"}
 
-    log.info(
-        f"Sending {len(papers)} papers to webhook for category {cat_str}..."
+    _send_feishu_payload_to_webhooks(
+        json_payload, headers, webhook_urls,
+        label=f"论文汇总（{len(papers)} 篇，分类 {cat_str}）",
     )
-    last_err: Optional[Exception] = None
-    for attempt in range(1, FEISHU_MAX_RETRIES + 1):
-        try:
-            resp = requests.post(
-                webhook_url,
-                data=json_payload,
-                headers=headers,
-                timeout=15,
-            )
-            resp.raise_for_status()
-            data = (
-                resp.json()
-                if resp.headers.get("content-type", "").startswith("application/json")
-                else {}
-            )
-            if not _feishu_response_ok(data):
-                raise RuntimeError(f"飞书返回非成功状态: {data}")
-            log.info("飞书消息发送成功")
-            return
-        except Exception as e:
-            last_err = e
-            if attempt < FEISHU_MAX_RETRIES:
-                delay = random.uniform(2, 10)
-                log.warning(
-                    f"飞书消息发送失败 (第 {attempt}/{FEISHU_MAX_RETRIES} 次): {e}，"
-                    f"{delay:.1f}s 后重试"
-                )
-                time.sleep(delay)
-            else:
-                log.error(
-                    f"飞书消息发送失败，已重试 {FEISHU_MAX_RETRIES} 次: {e}"
-                )
-                raise last_err
 
 
 # ─────────────────────────────────────────────
@@ -2850,12 +2878,13 @@ def send_digest_email(digest_text: str, categories: list[str], config: dict):
 def send_feishu_digest(
     digest_text: str,
     date_str: str,
-    webhook_url: str,
+    webhook_url: str | list[str],
     public_url: str = "",
 ) -> None:
     """Send plain-text daily digest to Feishu webhook."""
-    if not webhook_url:
-        log.info("未设置 FEISHU_WEBHOOK_URL，跳过飞书推送")
+    webhook_urls = parse_webhook_urls(webhook_url)
+    if not webhook_urls:
+        log.info("未设置 FEISHU_WEBHOOK_URLS / FEISHU_WEBHOOK_URL，跳过飞书推送")
         return
 
     header = f"ArxivWatcher 每日综述 - {date_str}"
@@ -2868,40 +2897,10 @@ def send_feishu_digest(
     json_payload = json.dumps(payload, ensure_ascii=False)
     headers = {"Content-Type": "application/json"}
 
-    log.info(f"发送每日综述到飞书 webhook ({len(digest_text)} 字符)...")
-    last_err: Optional[Exception] = None
-    for attempt in range(1, FEISHU_MAX_RETRIES + 1):
-        try:
-            resp = requests.post(
-                webhook_url,
-                data=json_payload,
-                headers=headers,
-                timeout=15,
-            )
-            resp.raise_for_status()
-            data = (
-                resp.json()
-                if resp.headers.get("content-type", "").startswith("application/json")
-                else {}
-            )
-            if not _feishu_response_ok(data):
-                raise RuntimeError(f"飞书返回非成功状态: {data}")
-            log.info("飞书综述消息发送成功")
-            return
-        except Exception as e:
-            last_err = e
-            if attempt < FEISHU_MAX_RETRIES:
-                delay = random.uniform(2, 10)
-                log.warning(
-                    f"飞书综述发送失败 (第 {attempt}/{FEISHU_MAX_RETRIES} 次): {e}，"
-                    f"{delay:.1f}s 后重试"
-                )
-                time.sleep(delay)
-            else:
-                log.error(
-                    f"飞书综述发送失败，已重试 {FEISHU_MAX_RETRIES} 次: {e}"
-                )
-                raise last_err
+    _send_feishu_payload_to_webhooks(
+        json_payload, headers, webhook_urls,
+        label=f"每日综述（{len(digest_text)} 字符）",
+    )
 
 
 # ─────────────────────────────────────────────
@@ -2965,7 +2964,7 @@ def main():
     parser.add_argument(
         "--test-feishu",
         action="store_true",
-        help="从论文快照 JSON 向 FEISHU_WEBHOOK_URL 发测试消息（不调 arXiv / LLM / 邮件）",
+        help="从论文快照 JSON 向已配置的全部飞书机器人发测试消息（不调 arXiv / LLM / 邮件）",
     )
     parser.add_argument(
         "--test-feishu-json",
@@ -3004,7 +3003,7 @@ def main():
 
     if args.test_feishu:
         today = now_bj().strftime("%Y-%m-%d")
-        feishu_webhook = os.environ.get("FEISHU_WEBHOOK_URL", "").strip()
+        feishu_webhooks = configured_webhook_urls()
         public_url = os.environ.get("WEB_PUBLIC_URL", "").strip()
         json_path = Path(args.test_feishu_json)
         log.info("=" * 60)
@@ -3019,7 +3018,7 @@ def main():
             log.error("JSON 中 papers 为空，退出")
             sys.exit(1)
         date_for_msg = digest_date or today
-        send_feishu_message(papers, cats, date_for_msg, feishu_webhook, public_url)
+        send_feishu_message(papers, cats, date_for_msg, feishu_webhooks, public_url)
         log.info("--test-feishu 结束")
         sys.exit(0)
 
@@ -3333,20 +3332,20 @@ def main():
 
     # ── 飞书 ──
     if not args.no_feishu:
-        feishu_webhook = os.environ.get("FEISHU_WEBHOOK_URL", "").strip()
+        feishu_webhooks = configured_webhook_urls()
         public_url = os.environ.get("WEB_PUBLIC_URL", "").strip()
-        if not feishu_webhook:
-            log.info("未配置 FEISHU_WEBHOOK_URL，跳过飞书推送")
+        if not feishu_webhooks:
+            log.info("未配置 FEISHU_WEBHOOK_URLS / FEISHU_WEBHOOK_URL，跳过飞书推送")
         else:
             try:
                 if digest_text:
-                    send_feishu_digest(digest_text, today, feishu_webhook, public_url)
+                    send_feishu_digest(digest_text, today, feishu_webhooks, public_url)
                 else:
                     send_feishu_message(
                         processing_papers,
                         args.category,
                         today,
-                        feishu_webhook,
+                        feishu_webhooks,
                         public_url,
                     )
             except Exception as e:

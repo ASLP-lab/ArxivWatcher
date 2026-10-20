@@ -29,7 +29,10 @@ fi
 # export EMAIL_TO="recipient@example.com"
 
 # ── 飞书机器人（可选）──
+# 单机器人（旧配置仍支持）
 # export FEISHU_WEBHOOK_URL="https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx"
+# 多机器人：支持逗号、分号、空白分隔，或 JSON 数组
+# export FEISHU_WEBHOOK_URLS="https://open.feishu.cn/open-apis/bot/v2/hook/aaa,https://open.feishu.cn/open-apis/bot/v2/hook/bbb"
 
 # Web / 插件下载页展示的公网地址（飞书消息、Zotero xpi 会用到）
 export WEB_PUBLIC_URL="${WEB_PUBLIC_URL:-http://127.0.0.1:8091}"

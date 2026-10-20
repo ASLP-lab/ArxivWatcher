@@ -17,8 +17,8 @@
         {% endfor %}
       </select>
     </label>
-    <label>条目数量
-      <input type="number" min="1" max="200" name="limit" value="{{ limit }}">
+    <label>订阅天数
+      <input type="number" min="1" max="90" name="limit" value="{{ limit }}">
     </label>
     <button type="submit">更新订阅链接</button>
   </form>
@@ -35,21 +35,19 @@
 </section>
 
 <section class="search-results">
-  {% for p in papers %}
+  {% for d in digests %}
   <article class="paper-card">
     <div class="paper-card-top">
-      <a class="date-link" href="{{ url_for('view_date', date=p.date) }}">{{ p.date }}</a>
-      {% for c in p.source_categories %}<span class="cat-tag">{{ c }}</span>{% endfor %}
-      {% if p.is_cross_list %}<span class="badge badge-cross">跨领域</span>{% endif %}
+      <a class="date-link" href="{{ url_for('view_date', date=d.date) }}">{{ d.date }}</a>
+      {% for c in d.categories %}<span class="cat-tag">{{ c }}</span>{% endfor %}
+      <span class="badge">{{ d.paper_count or 0 }} 篇</span>
+      {% if d.fallback %}<span class="badge badge-cross">快照总览</span>{% endif %}
     </div>
-    <h2><a href="{{ p.abs_url }}" target="_blank">{{ p.title }}</a></h2>
-    <div class="paper-authors">{{ p.authors|join(', ') }}</div>
-    {% if p.abstract %}
-      <details class="abstract"><summary>摘要</summary><p>{{ p.abstract }}</p></details>
-    {% endif %}
+    <h2><a href="{{ url_for('view_date', date=d.date) }}">ArxivWatcher 每日综述</a></h2>
+    <div class="paper-authors rss-digest-text">{{ d.text }}</div>
   </article>
   {% else %}
-    <p class="empty-hint">当前条件下没有可订阅的论文。</p>
+    <p class="empty-hint">当前条件下还没有每日论文综述。</p>
   {% endfor %}
 </section>
 {% endblock %}
